@@ -2,7 +2,6 @@ import React, { useState, useRef, useEffect } from "react";
 
 function App() {
   const [recording, setRecording] = useState(false);
-  const [paused, setPaused] = useState(false);
   const [videoURL, setVideoURL] = useState(null);
   const [status, setStatus] = useState("");
   const [duration, setDuration] = useState(0);
@@ -16,19 +15,203 @@ function App() {
   const audioContextRef = useRef(null);
   const timerRef = useRef(null);
 
-  // Cleanup timer on unmount
+  const micAnalyserRef = useRef(null);
+  const systemAnalyserRef = useRef(null);
+  const animationRef = useRef(null);
+  const canvasRef = useRef(null);
+
+  // cleanup
   useEffect(() => {
     return () => {
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-      }
+      if (timerRef.current) clearInterval(timerRef.current);
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
   }, []);
 
+  const startRecording = async () => {
+    if (recording) return;
+
+    try {
+      setStatus("Requesting permissions...");
+      setDuration(0);
+      setRecordingSize(0);
+
+      // 🎤 Mic
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = micStream;
+
+      // 💻 Screen
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: "always" },
+        audio: true,
+      });
+      screenStreamRef.current = screenStream;
+
+      // 🎧 AudioContext setup
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      audioContextRef.current = audioContext;
+      const destination = audioContext.createMediaStreamDestination();
+
+      // 🎚️ Mix mic and screen audio
+      const micSource = audioContext.createMediaStreamSource(micStream);
+      const micGain = audioContext.createGain();
+      micGain.gain.value = 1.0;
+      micSource.connect(micGain);
+      micGain.connect(destination);
+
+      if (screenStream.getAudioTracks().length > 0) {
+        const screenSource = audioContext.createMediaStreamSource(screenStream);
+        const screenGain = audioContext.createGain();
+        screenGain.gain.value = 1.0;
+        screenSource.connect(screenGain);
+        screenGain.connect(destination);
+      } else {
+        console.warn("No system audio detected");
+      }
+
+      // 🎞️ Combine video + mixed audio
+      const combinedStream = new MediaStream([
+        ...screenStream.getVideoTracks(),
+        ...destination.stream.getAudioTracks(),
+      ]);
+      streamRef.current = combinedStream;
+
+      // 🔍 Create analysers for live levels
+      micAnalyserRef.current = audioContext.createAnalyser();
+      const micSourceForVis = audioContext.createMediaStreamSource(micStream);
+      micSourceForVis.connect(micAnalyserRef.current);
+
+      if (screenStream.getAudioTracks().length > 0) {
+        systemAnalyserRef.current = audioContext.createAnalyser();
+        const systemSourceForVis = audioContext.createMediaStreamSource(screenStream);
+        systemSourceForVis.connect(systemAnalyserRef.current);
+      }
+
+      visualizeAudioLevels();
+
+      // 🎬 Recorder setup
+      const mimeType = getSupportedMimeType();
+      const mediaRecorder = new MediaRecorder(combinedStream, { mimeType });
+      mediaRecorderRef.current = mediaRecorder;
+      chunksRef.current = [];
+
+      mediaRecorder.ondataavailable = async (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+          setRecordingSize((prev) => prev + event.data.size);
+
+          const arrayBuffer = await event.data.arrayBuffer();
+          console.log(`📦 Chunk: ${arrayBuffer.byteLength} bytes`);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunksRef.current, { type: mimeType });
+        const url = URL.createObjectURL(blob);
+
+        if (videoURL) URL.revokeObjectURL(videoURL);
+        setVideoURL(url);
+
+        setStatus("Recording complete! Downloading video...");
+
+        // 🟢 Auto-download locally
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `recording_${Date.now()}.webm`;
+        a.click();
+
+        // 🟡 (Optional) Upload to your backend / S3 later
+        // const formData = new FormData();
+        // formData.append("file", blob, `recording_${Date.now()}.webm`);
+        // await fetch("https://your-backend.com/upload/", {
+        //   method: "POST",
+        //   body: formData,
+        // });
+
+        console.log("✅ Recording ready:", url);
+      };
+
+
+      mediaRecorder.start(1000);
+      setRecording(true);
+      setStatus("🔴 Recording...");
+
+      timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
+
+      screenStream.getVideoTracks()[0].addEventListener("ended", stopRecording);
+    } catch (err) {
+      console.error(err);
+      setStatus("Error: " + err.message);
+    }
+  };
+
+  const stopRecording = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      mediaRecorderRef.current.stop();
+    }
+    if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
+    if (micStreamRef.current) micStreamRef.current.getTracks().forEach((t) => t.stop());
+    if (screenStreamRef.current) screenStreamRef.current.getTracks().forEach((t) => t.stop());
+    if (audioContextRef.current) audioContextRef.current.close();
+
+    setRecording(false);
+    setStatus("✅ Stopped");
+
+    if (timerRef.current) clearInterval(timerRef.current);
+    if (animationRef.current) cancelAnimationFrame(animationRef.current);
+  };
+
+  const getSupportedMimeType = () => {
+    const types = [
+      "video/webm;codecs=vp9,opus",
+      "video/webm;codecs=vp8,opus",
+      "video/webm",
+    ];
+    return types.find((t) => MediaRecorder.isTypeSupported(t)) || "";
+  };
+
+  // 🟢 visualize mic/system levels
+  const visualizeAudioLevels = () => {
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+
+    const micAnalyser = micAnalyserRef.current;
+    const sysAnalyser = systemAnalyserRef.current;
+    const micData = new Uint8Array(micAnalyser.frequencyBinCount);
+    const sysData = sysAnalyser ? new Uint8Array(sysAnalyser.frequencyBinCount) : null;
+
+    const draw = () => {
+      animationRef.current = requestAnimationFrame(draw);
+      micAnalyser.getByteFrequencyData(micData);
+      if (sysAnalyser) sysAnalyser.getByteFrequencyData(sysData);
+
+      const micAvg = micData.reduce((a, b) => a + b, 0) / micData.length;
+      const sysAvg = sysData ? sysData.reduce((a, b) => a + b, 0) / sysData.length : 0;
+
+      console.log(`🎤 Mic: ${micAvg.toFixed(1)} | 💻 System: ${sysAvg.toFixed(1)}`);
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.fillStyle = "#222";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      ctx.fillStyle = "#4caf50";
+      ctx.fillRect(50, canvas.height - micAvg, 80, micAvg);
+
+      ctx.fillStyle = "#2196f3";
+      ctx.fillRect(200, canvas.height - sysAvg, 80, sysAvg);
+
+      ctx.fillStyle = "#fff";
+      ctx.font = "14px Arial";
+      ctx.fillText("🎤 Mic", 60, canvas.height - 5);
+      ctx.fillText("💻 System", 200, canvas.height - 5);
+    };
+    draw();
+  };
+
   const formatTime = (seconds) => {
-    const mins = Math.floor(seconds / 60);
-    const secs = seconds % 60;
-    return `${mins}:${secs.toString().padStart(2, "0")}`;
+    const m = Math.floor(seconds / 60);
+    const s = seconds % 60;
+    return `${m}:${s.toString().padStart(2, "0")}`;
   };
 
   const formatSize = (bytes) => {
@@ -37,401 +220,91 @@ function App() {
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   };
 
-  const startRecording = async () => {
-    if (recording) return; // Prevent double-click
-
-    try {
-      setStatus("Requesting permissions...");
-      setDuration(0);
-      setRecordingSize(0);
-
-      // 🎤 1️⃣ Get microphone audio
-      const micStream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: false,
-          noiseSuppression: false,
-          autoGainControl: false,
-        },
-      });
-      micStreamRef.current = micStream;
-      setStatus("Microphone connected. Now select screen...");
-
-      // 🖥️ 2️⃣ Get screen (with tab/system audio)
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { cursor: "always" },
-        audio: true,
-      });
-      screenStreamRef.current = screenStream;
-      setStatus("Screen captured. Setting up audio mixing...");
-
-      // 🎧 3️⃣ Create audio context for mixing
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
-      audioContextRef.current = audioContext;
-      const destination = audioContext.createMediaStreamDestination();
-
-      // Connect microphone with stereo split
-      const micSource = audioContext.createMediaStreamSource(micStream);
-      const splitter = audioContext.createChannelSplitter(2);
-      const merger = audioContext.createChannelMerger(2);
-
-      micSource.connect(splitter);
-      splitter.connect(merger, 0, 0);
-      splitter.connect(merger, 0, 1);
-      merger.connect(destination);
-      setStatus("Microphone audio connected (stereo)");
-
-      // Connect screen audio (if available)
-      if (screenStream.getAudioTracks().length > 0) {
-        try {
-          const screenSource = audioContext.createMediaStreamSource(screenStream);
-          const screenSplitter = audioContext.createChannelSplitter(2);
-          const screenMerger = audioContext.createChannelMerger(2);
-
-          screenSource.connect(screenSplitter);
-          screenSplitter.connect(screenMerger, 0, 0);
-          screenSplitter.connect(screenMerger, 1, 1);
-          screenMerger.connect(destination);
-
-          setStatus("Screen audio connected + Microphone mixed (stereo)");
-        } catch (e) {
-          console.warn("Could not connect screen audio:", e);
-          setStatus("Screen connected (audio capture not supported on this browser)");
-        }
-      } else {
-        setStatus("Screen connected (no system audio detected)");
-      }
-
-      // 🧩 4️⃣ Combine video track + mixed audio track
-      const combinedStream = new MediaStream([
-        ...screenStream.getVideoTracks(),
-        ...destination.stream.getAudioTracks(),
-      ]);
-      streamRef.current = combinedStream;
-
-      // 🎞️ 5️⃣ Create MediaRecorder
-      const mimeType = getSupportedMimeType();
-      if (!mimeType) throw new Error("No supported MIME type found");
-
-      const mediaRecorder = new MediaRecorder(combinedStream, {
-        mimeType,
-        audioBitsPerSecond: 128000,
-        videoBitsPerSecond: 2500000,
-      });
-
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-          setRecordingSize((prev) => prev + event.data.size);
-        }
-      };
-
-      mediaRecorder.onstop = () => {
-        if (chunksRef.current.length === 0) {
-          setStatus("Recording stopped (no data recorded)");
-          return;
-        }
-
-        const blob = new Blob(chunksRef.current, { type: mimeType });
-        const url = URL.createObjectURL(blob);
-
-        // Revoke old URL if exists
-        if (videoURL) {
-          URL.revokeObjectURL(videoURL);
-        }
-        setVideoURL(url);
-        setStatus("Recording complete! Download started...");
-
-        // Auto-download
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `recording_${Date.now()}.webm`;
-        a.click();
-
-        // ✅ Close audio context
-        if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-          audioContextRef.current.close();
-        }
-
-        // Stop timer
-        if (timerRef.current) {
-          clearInterval(timerRef.current);
-          timerRef.current = null;
-        }
-      };
-
-      mediaRecorder.onerror = (event) => {
-        console.error("MediaRecorder error:", event.error);
-        setStatus(`Recording error: ${event.error}`);
-      };
-
-      // Start recording with 1-second chunks
-      mediaRecorder.start(1000);
-      setRecording(true);
-      setPaused(false);
-      setStatus("🔴 Recording in progress...");
-
-      // Start timer
-      timerRef.current = setInterval(() => {
-        setDuration((prev) => prev + 1);
-      }, 1000);
-
-      // ✅ Stop automatically when screen share ends
-      screenStream.getVideoTracks()[0].addEventListener("ended", () => {
-        setStatus("Screen sharing stopped by user");
-        stopRecording();
-      });
-    } catch (err) {
-      console.error("Recording error:", err);
-      
-      let userMessage = "Failed to start recording";
-      if (err.name === "NotAllowedError") {
-        userMessage = "Permission denied. Please allow microphone and screen sharing access.";
-      } else if (err.name === "NotFoundError") {
-        userMessage = "No microphone found. Please connect a microphone.";
-      } else if (err.name === "NotReadableError") {
-        userMessage = "Could not access media device. It may be in use by another application.";
-      } else if (err.message) {
-        userMessage = err.message;
-      }
-      
-      setStatus(`Error: ${userMessage}`);
-      alert(userMessage);
-      
-      // Cleanup on error
-      cleanupResources();
-    }
-  };
-
-  const pauseRecording = () => {
-    if (mediaRecorderRef.current?.state === "recording") {
-      mediaRecorderRef.current.pause();
-      setPaused(true);
-      setStatus("⏸️ Recording paused");
-      
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-    }
-  };
-
-  const resumeRecording = () => {
-    if (mediaRecorderRef.current?.state === "paused") {
-      mediaRecorderRef.current.resume();
-      setPaused(false);
-      setStatus("🔴 Recording resumed");
-      
-      timerRef.current = setInterval(() => {
-        setDuration((prev) => prev + 1);
-      }, 1000);
-    }
-  };
-
-  const stopRecording = () => {
-    try {
-      setStatus("Stopping recording...");
-
-      // 🛑 Stop the MediaRecorder
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
-
-      setRecording(false);
-      setPaused(false);
-
-      // Stop timer
-      if (timerRef.current) {
-        clearInterval(timerRef.current);
-        timerRef.current = null;
-      }
-
-      // Cleanup resources
-      cleanupResources();
-
-      setTimeout(() => {
-        setStatus("Recording stopped ✅");
-      }, 500);
-    } catch (err) {
-      console.error("Error stopping recording:", err);
-      setStatus(`Stop error: ${err.message}`);
-      setRecording(false);
-      setPaused(false);
-    }
-  };
-
-  const cleanupResources = () => {
-    // 🧹 Stop all media tracks
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach((t) => t.stop());
-      streamRef.current = null;
-    }
-    if (screenStreamRef.current) {
-      screenStreamRef.current.getTracks().forEach((t) => t.stop());
-      screenStreamRef.current = null;
-    }
-    if (micStreamRef.current) {
-      micStreamRef.current.getTracks().forEach((t) => t.stop());
-      micStreamRef.current = null;
-    }
-
-    // 🧠 Close AudioContext
-    if (audioContextRef.current && audioContextRef.current.state !== "closed") {
-      audioContextRef.current.close();
-      audioContextRef.current = null;
-    }
-  };
-
-  const getSupportedMimeType = () => {
-    const types = [
-      "video/mp4;codecs=avc1,mp4a",  // Try MP4 first
-      "video/mp4",
-      "video/webm;codecs=vp9,opus",
-      "video/webm;codecs=vp8,opus",
-      "video/webm;codecs=h264,opus",
-      "video/webm",
-    ];
-    for (let t of types) {
-      if (MediaRecorder.isTypeSupported(t)) {
-        console.log("Using MIME type:", t);
-        return t;
-      }
-    }
-    return null;
-  };
-
   return (
     <div style={{ textAlign: "center", marginTop: 50, fontFamily: "Arial" }}>
-      <h1>🎥 Screen + Microphone + System Audio Recorder</h1>
+      <h1>🎥 Screen + Mic + System Audio Recorder (Realtime Logs)</h1>
 
-      <div style={{ marginBottom: 20 }}>
-        {!recording ? (
-          <button
-            onClick={startRecording}
-            style={{
-              background: "#44aa44",
-              color: "white",
-              padding: "12px 24px",
-              fontSize: "16px",
-              border: "none",
-              borderRadius: "5px",
-              cursor: "pointer",
-              marginRight: "10px",
-            }}
-          >
-            🔴 Start Recording
-          </button>
-        ) : (
-          <>
-            <button
-              onClick={paused ? resumeRecording : pauseRecording}
-              style={{
-                background: "#ff9800",
-                color: "white",
-                padding: "12px 24px",
-                fontSize: "16px",
-                border: "none",
-                borderRadius: "5px",
-                cursor: "pointer",
-                marginRight: "10px",
-              }}
-            >
-              {paused ? "▶️ Resume" : "⏸️ Pause"}
-            </button>
-            <button
-              onClick={stopRecording}
-              style={{
-                background: "#ff4444",
-                color: "white",
-                padding: "12px 24px",
-                fontSize: "16px",
-                border: "none",
-                borderRadius: "5px",
-                cursor: "pointer",
-              }}
-            >
-              ⏹️ Stop Recording
-            </button>
-          </>
-        )}
+      {!recording ? (
+        <button
+          onClick={startRecording}
+          style={{
+            background: "#4caf50",
+            color: "white",
+            padding: "12px 24px",
+            fontSize: "16px",
+            border: "none",
+            borderRadius: "5px",
+            cursor: "pointer",
+          }}
+        >
+          🔴 Start Recording
+        </button>
+      ) : (
+        <button
+          onClick={stopRecording}
+          style={{
+            background: "#f44336",
+            color: "white",
+            padding: "12px 24px",
+            fontSize: "16px",
+            border: "none",
+            borderRadius: "5px",
+            cursor: "pointer",
+          }}
+        >
+          ⏹️ Stop
+        </button>
+      )}
+
+      <div style={{ marginTop: 20 }}>
+        <canvas
+          ref={canvasRef}
+          width={350}
+          height={100}
+          style={{
+            background: "#111",
+            borderRadius: "8px",
+            marginTop: "10px",
+          }}
+        />
       </div>
 
       {recording && (
-        <div
-          style={{
-            display: "inline-block",
-            padding: "10px 20px",
-            backgroundColor: paused ? "#ffe0b2" : "#ffebee",
-            borderRadius: "5px",
-            marginBottom: 15,
-          }}
-        >
-          <div style={{ fontSize: "24px", fontWeight: "bold", color: "#d32f2f" }}>
-            {formatTime(duration)}
+        <div style={{ marginTop: 10 }}>
+          <div style={{ fontSize: "18px", color: "#333" }}>
+            Time: {formatTime(duration)} | Size: {formatSize(recordingSize)}
           </div>
-          <div style={{ fontSize: "12px", color: "#666", marginTop: 5 }}>
-            Size: {formatSize(recordingSize)}
+          <div style={{ color: "#2e7d32", marginTop: 5 }}>
+            🟢 Streaming chunks (check console)
           </div>
+        </div>
+      )}
+
+      {videoURL && (
+        <div style={{ marginTop: 30 }}>
+          <h3>📹 Recorded Preview</h3>
+          <video
+            src={videoURL}
+            controls
+            width="600"
+            style={{ borderRadius: "5px" }}
+          />
         </div>
       )}
 
       {status && (
         <div
           style={{
-            marginTop: 15,
-            padding: "10px",
-            backgroundColor: "#f0f0f0",
+            marginTop: 20,
+            background: "#f0f0f0",
             borderRadius: "5px",
-            color: "#333",
-            maxWidth: "600px",
-            margin: "15px auto",
+            padding: "10px",
+            display: "inline-block",
           }}
         >
           <strong>Status:</strong> {status}
         </div>
       )}
-
-      {videoURL && (
-        <div style={{ marginTop: 30 }}>
-          <h3>📹 Recorded Preview:</h3>
-          <video src={videoURL} controls width="600" style={{ borderRadius: "5px" }} />
-          <p style={{ fontSize: "14px", color: "#666" }}>
-            Your recording has been downloaded automatically
-          </p>
-        </div>
-      )}
-
-      <div
-        style={{
-          marginTop: 40,
-          padding: "15px",
-          backgroundColor: "#fffbcc",
-          borderRadius: "5px",
-          textAlign: "left",
-          maxWidth: "600px",
-          margin: "40px auto 0",
-        }}
-      >
-        <h4>📝 Tips for best results:</h4>
-        <ul style={{ marginLeft: "20px" }}>
-          <li>
-            <strong>System Audio:</strong> Works best when you select "Share tab audio" in Chrome
-            or Edge
-          </li>
-          <li>
-            <strong>Pause/Resume:</strong> You can pause recording and resume later without losing
-            data
-          </li>
-          <li>
-            <strong>Browser Support:</strong> Chrome/Edge have best support for mic + system audio
-          </li>
-          <li>
-            <strong>Permissions:</strong> Allow both microphone and screen/audio when prompted
-          </li>
-        </ul>
-      </div>
     </div>
   );
 }
