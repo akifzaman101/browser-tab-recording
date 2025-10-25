@@ -22,3 +22,18 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+
+#beackend
+backend/received_recordings
+backend/venv/
+
+#Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+#Environment files
+.env
+*.env

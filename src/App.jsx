@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from "react";
+import './App.css';
 
 function App() {
   const [recording, setRecording] = useState(false);
@@ -6,6 +7,8 @@ function App() {
   const [status, setStatus] = useState("");
   const [duration, setDuration] = useState(0);
   const [recordingSize, setRecordingSize] = useState(0);
+  const [wsConnected, setWsConnected] = useState(false);
+  const [wsStatus, setWsStatus] = useState("Disconnected");
 
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -20,16 +23,75 @@ function App() {
   const animationRef = useRef(null);
   const canvasRef = useRef(null);
 
+  // WebSocket ref
+  const wsRef = useRef(null);
+
   // cleanup
   useEffect(() => {
+    // Connect to WebSocket on mount
+    connectWebSocket();
+
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (wsRef.current) {
+        wsRef.current.close();
+      }
     };
   }, []);
 
+  const connectWebSocket = () => {
+    try {
+      const ws = new WebSocket("ws://localhost:8765");
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        console.log("✅ WebSocket Connected");
+        setWsConnected(true);
+        setWsStatus("Connected");
+      };
+
+      ws.onmessage = (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          console.log("📨 Server response:", data);
+
+          if (data.type === "connected") {
+            console.log("Session ID:", data.session_id);
+          } else if (data.type === "chunk_received") {
+            console.log(`✅ Chunk ${data.chunk_number} confirmed by server`);
+          } else if (data.type === "recording_saved") {
+            console.log("📁 Server saved recording:", data.stats);
+          }
+        } catch (e) {
+          console.log("Server message:", event.data);
+          console.error("Failed to parse server message:", e);
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error("❌ WebSocket Error:", error);
+        setWsStatus("Error");
+      };
+
+      ws.onclose = () => {
+        console.log("🔴 WebSocket Disconnected");
+        setWsConnected(false);
+        setWsStatus("Disconnected");
+      };
+    } catch (error) {
+      console.error("Failed to connect WebSocket:", error);
+      setWsStatus("Failed to connect");
+    }
+  };
+
   const startRecording = async () => {
     if (recording) return;
+
+    if (!wsConnected) {
+      alert("WebSocket not connected! Please refresh the page.");
+      return;
+    }
 
     try {
       setStatus("Requesting permissions...");
@@ -76,7 +138,7 @@ function App() {
       ]);
       streamRef.current = combinedStream;
 
-      // 🔍 Create analysers for live levels
+      // 📊 Create analysers for live levels
       micAnalyserRef.current = audioContext.createAnalyser();
       const micSourceForVis = audioContext.createMediaStreamSource(micStream);
       micSourceForVis.connect(micAnalyserRef.current);
@@ -102,6 +164,18 @@ function App() {
 
           const arrayBuffer = await event.data.arrayBuffer();
           console.log(`📦 Chunk: ${arrayBuffer.byteLength} bytes`);
+
+          // 🚀 Send chunk to WebSocket server
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            try {
+              wsRef.current.send(arrayBuffer);
+              console.log(`✅ Sent ${arrayBuffer.byteLength} bytes to server`);
+            } catch (error) {
+              console.error("❌ Failed to send chunk:", error);
+            }
+          } else {
+            console.warn("⚠️ WebSocket not ready, chunk not sent");
+          }
         }
       };
 
@@ -112,7 +186,7 @@ function App() {
         if (videoURL) URL.revokeObjectURL(videoURL);
         setVideoURL(url);
 
-        setStatus("Recording complete! Downloading video...");
+        setStatus("Recording complete");
 
         // 🟢 Auto-download locally
         const a = document.createElement("a");
@@ -120,21 +194,22 @@ function App() {
         a.download = `recording_${Date.now()}.webm`;
         a.click();
 
-        // 🟡 (Optional) Upload to your backend / S3 later
-        // const formData = new FormData();
-        // formData.append("file", blob, `recording_${Date.now()}.webm`);
-        // await fetch("https://your-backend.com/upload/", {
-        //   method: "POST",
-        //   body: formData,
-        // });
+        // 📤 Notify server that recording is complete
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({
+            type: "recording_complete",
+            timestamp: Date.now(),
+            total_size: recordingSize,
+            duration: duration
+          }));
+        }
 
         console.log("✅ Recording ready:", url);
       };
 
-
       mediaRecorder.start(1000);
       setRecording(true);
-      setStatus("🔴 Recording...");
+      setStatus("Recording...");
 
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
 
@@ -155,7 +230,7 @@ function App() {
     if (audioContextRef.current) audioContextRef.current.close();
 
     setRecording(false);
-    setStatus("✅ Stopped");
+    setStatus("Stopped");
 
     if (timerRef.current) clearInterval(timerRef.current);
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
@@ -188,22 +263,25 @@ function App() {
       const micAvg = micData.reduce((a, b) => a + b, 0) / micData.length;
       const sysAvg = sysData ? sysData.reduce((a, b) => a + b, 0) / sysData.length : 0;
 
-      console.log(`🎤 Mic: ${micAvg.toFixed(1)} | 💻 System: ${sysAvg.toFixed(1)}`);
-
       ctx.clearRect(0, 0, canvas.width, canvas.height);
-      ctx.fillStyle = "#222";
+      ctx.fillStyle = "#f5f5f5";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      ctx.fillStyle = "#4caf50";
-      ctx.fillRect(50, canvas.height - micAvg, 80, micAvg);
+      // Mic bar
+      const micHeight = (micAvg / 255) * (canvas.height - 30);
+      ctx.fillStyle = "#4CAF50";
+      ctx.fillRect(60, canvas.height - 25 - micHeight, 50, micHeight);
 
-      ctx.fillStyle = "#2196f3";
-      ctx.fillRect(200, canvas.height - sysAvg, 80, sysAvg);
+      // System bar
+      const sysHeight = (sysAvg / 255) * (canvas.height - 30);
+      ctx.fillStyle = "#2196F3";
+      ctx.fillRect(190, canvas.height - 25 - sysHeight, 50, sysHeight);
 
-      ctx.fillStyle = "#fff";
-      ctx.font = "14px Arial";
-      ctx.fillText("🎤 Mic", 60, canvas.height - 5);
-      ctx.fillText("💻 System", 200, canvas.height - 5);
+      // Labels
+      ctx.fillStyle = "#666";
+      ctx.font = "13px system-ui, -apple-system, sans-serif";
+      ctx.fillText("Microphone", 40, canvas.height - 8);
+      ctx.fillText("System Audio", 165, canvas.height - 8);
     };
     draw();
   };
@@ -221,90 +299,84 @@ function App() {
   };
 
   return (
-    <div style={{ textAlign: "center", marginTop: 50, fontFamily: "Arial" }}>
-      <h1>🎥 Screen + Mic + System Audio Recorder (Realtime Logs)</h1>
-
-      {!recording ? (
-        <button
-          onClick={startRecording}
-          style={{
-            background: "#4caf50",
-            color: "white",
-            padding: "12px 24px",
-            fontSize: "16px",
-            border: "none",
-            borderRadius: "5px",
-            cursor: "pointer",
-          }}
-        >
-          🔴 Start Recording
-        </button>
-      ) : (
-        <button
-          onClick={stopRecording}
-          style={{
-            background: "#f44336",
-            color: "white",
-            padding: "12px 24px",
-            fontSize: "16px",
-            border: "none",
-            borderRadius: "5px",
-            cursor: "pointer",
-          }}
-        >
-          ⏹️ Stop
-        </button>
-      )}
-
-      <div style={{ marginTop: 20 }}>
-        <canvas
-          ref={canvasRef}
-          width={350}
-          height={100}
-          style={{
-            background: "#111",
-            borderRadius: "8px",
-            marginTop: "10px",
-          }}
-        />
-      </div>
-
-      {recording && (
-        <div style={{ marginTop: 10 }}>
-          <div style={{ fontSize: "18px", color: "#333" }}>
-            Time: {formatTime(duration)} | Size: {formatSize(recordingSize)}
-          </div>
-          <div style={{ color: "#2e7d32", marginTop: 5 }}>
-            🟢 Streaming chunks (check console)
-          </div>
+    <div className="app-container">
+      <div className="app-content">
+        
+        {/* Header */}
+        <div className="app-header">
+          <h1 className="app-title">Screen Recorder</h1>
+          <p className="app-subtitle">Record screen with microphone and system audio</p>
         </div>
-      )}
 
-      {videoURL && (
-        <div style={{ marginTop: 30 }}>
-          <h3>📹 Recorded Preview</h3>
-          <video
-            src={videoURL}
-            controls
-            width="600"
-            style={{ borderRadius: "5px" }}
+        {/* WebSocket Status */}
+        <div className="ws-status">
+          <div className={`ws-indicator ${wsConnected ? 'connected' : 'disconnected'}`}></div>
+          <span className="ws-status-text">{wsStatus}</span>
+        </div>
+
+        {/* Control Button */}
+        <div className="control-section">
+          {!recording ? (
+            <button
+              onClick={startRecording}
+              disabled={!wsConnected}
+              className="control-btn start"
+            >
+              Start Recording
+            </button>
+          ) : (
+            <button
+              onClick={stopRecording}
+              className="control-btn stop"
+            >
+              Stop Recording
+            </button>
+          )}
+        </div>
+
+        {/* Audio Visualizer */}
+        <div className="visualizer-container">
+          <canvas
+            ref={canvasRef}
+            width={350}
+            height={100}
+            className="visualizer-canvas"
           />
         </div>
-      )}
 
-      {status && (
-        <div
-          style={{
-            marginTop: 20,
-            background: "#f0f0f0",
-            borderRadius: "5px",
-            padding: "10px",
-            display: "inline-block",
-          }}
-        >
-          <strong>Status:</strong> {status}
-        </div>
-      )}
+        {/* Recording Stats */}
+        {recording && (
+          <div className="stats-container">
+            <div className="stat-item">
+              <div className="stat-label">Duration</div>
+              <div className="stat-value">{formatTime(duration)}</div>
+            </div>
+            <div className="stat-item">
+              <div className="stat-label">Size</div>
+              <div className="stat-value">{formatSize(recordingSize)}</div>
+            </div>
+          </div>
+        )}
+
+        {/* Status Message */}
+        {status && (
+          <div className="status-message">
+            <span className="status-text">{status}</span>
+          </div>
+        )}
+
+        {/* Video Preview */}
+        {videoURL && (
+          <div className="video-preview">
+            <h3 className="video-title">Recorded Video</h3>
+            <video
+              src={videoURL}
+              controls
+              className="video-player"
+            />
+          </div>
+        )}
+      </div>
     </div>
   );
 }
