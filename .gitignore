@@ -28,6 +28,8 @@ dist-ssr
 backend/received_recordings
 backend/venv/
 
+service-account.json
+
 #Python cache files
 __pycache__/
 *.pyc
