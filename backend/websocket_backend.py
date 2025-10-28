@@ -8,21 +8,24 @@ from datetime import datetime
 import os
 from typing import Optional
 from collections import Counter
-
-from dotenv import load_dotenv
-load_dotenv("../.env")
-
+from openai import OpenAI
 from google.cloud import speech_v1p1beta1 as speech
 import threading
 import queue
+from dotenv import load_dotenv
+
+load_dotenv("../.env")
 
 SAVE_DIR = "received_recordings"
 os.makedirs(SAVE_DIR, exist_ok=True)
+
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class RecordingSession:
     def __init__(self, session_id, file_ext="raw"):
         self.session_id = session_id
         self.chunks = []
+        self.transcripts = []  # ✅ NEW: Store transcripts
         self.total_bytes = 0
         self.start_time = datetime.now()
         self.filepath = os.path.join(SAVE_DIR, f"recording_{session_id}.{file_ext}")
@@ -33,6 +36,15 @@ class RecordingSession:
         with open(self.filepath, "ab") as f:
             f.write(chunk_data)
     
+    def add_transcript(self, speaker: str, text: str, language: str):  # ✅ NEW
+        """Add a final transcript line."""
+        self.transcripts.append({
+            "speaker": speaker,
+            "text": text,
+            "language": language,
+            "timestamp": datetime.now().isoformat()
+        })
+    
     def get_stats(self):
         duration = (datetime.now() - self.start_time).total_seconds()
         return {
@@ -41,7 +53,8 @@ class RecordingSession:
             "total_bytes": self.total_bytes,
             "total_mb": round(self.total_bytes / (1024 * 1024), 2),
             "duration_seconds": round(duration, 2),
-            "filepath": self.filepath
+            "filepath": self.filepath,
+            "transcript_lines": len(self.transcripts)  # ✅ NEW
         }
 
 sessions = {}
@@ -73,16 +86,46 @@ def build_streaming_config(sample_rate: int = 48000) -> speech.StreamingRecognit
         interim_results=True,
         single_utterance=False,
     )
+    
+def generate_summary(transcripts: list) -> dict:
+    """Generate summary from transcripts using OpenAI."""
+    if not transcripts:
+        return {"summary": "No transcription available", "key_points": []}
+    
+    # Combine all transcripts
+    full_text = "\n".join([f"{t['speaker']}: {t['text']}" for t in transcripts])
+    
+    try:
+        response = openai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that summarizes conversations. Provide a concise brief summary and extract 3-5 key points."},
+                {"role": "user", "content": f"Summarize this conversation:\n\n{full_text}\n\nProvide:\n1. A brief summary (2-3 sentences)\n2. Key points (3-5 bullet points)"}
+            ],
+            temperature=0.7,
+            max_tokens=500
+        )
+        
+        summary_text = response.choices[0].message.content
+        print(f"✅ Summary generated: {len(summary_text)} chars")
+        return {"summary": summary_text, "error": None}
+    
+    except Exception as e:
+        print(f"❌ Summary generation failed: {e}")
+        return {"summary": None, "error": str(e)}
+
+    
 
 def start_stt_thread(
     audio_q: "queue.Queue[Optional[bytes]]",
     websocket: websockets.WebSocketServerProtocol,
     loop: asyncio.AbstractEventLoop,
     sample_rate: int,
+    session: RecordingSession,  # ✅ NEW: Pass session
 ):
     print(f"🎤 STT thread started ({sample_rate}Hz, EN/JP, 2 speakers)")
     
-    while True:  # Auto-restart loop
+    while True:
         streaming_config = build_streaming_config(sample_rate)
         
         def audio_generator():
@@ -132,6 +175,10 @@ def start_stt_thread(
                     speaker_label = f"Speaker {speaker_tag}" if speaker_tag else "Speaker"
                     confidence = getattr(alt, 'confidence', None) if is_final else None
                     
+                    # ✅ NEW: Store final transcripts in session
+                    if is_final and transcript.strip():
+                        session.add_transcript(speaker_label, transcript, language_name)
+                    
                     status = "✅" if is_final else "⏳"
                     print(f"{status} [{language_name}] {speaker_label}: {transcript}")
 
@@ -148,32 +195,32 @@ def start_stt_thread(
                     
                     asyncio.run_coroutine_threadsafe(websocket.send(json.dumps(payload)), loop)
             
-            # Stream ended normally (got None from queue)
             print("✅ STT stream closed")
-            break  # Exit restart loop
+            break
             
         except Exception as e:
             error_str = str(e)
             
-            # Check if it's a timeout - restart silently
             if "Audio Timeout" in error_str or "OUT_OF_RANGE" in error_str:
                 print("⟳ Restarting stream (silence timeout)")
-                continue  # Restart stream
+                continue
             else:
-                # Real error - exit
                 print(f"❌ STT error: {e}")
                 break
     
     print("🎤 STT thread exiting")
+
+
 
 async def handle_client(websocket):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     session = RecordingSession(session_id, file_ext="raw")
     sessions[session_id] = session
 
-    audio_q: "queue.Queue[Optional[bytes]]" = queue.Queue()
+    audio_q: "queue.Queue[Optional[bytes]]" = None
     current_sample_rate = 48000
     recording_active = False
+    stt_thread = None
 
     print(f"\n🟢 New client: {session_id}")
 
@@ -184,23 +231,27 @@ async def handle_client(websocket):
     }))
 
     loop = asyncio.get_event_loop()
-    stt_thread = threading.Thread(
-        target=start_stt_thread,
-        args=(audio_q, websocket, loop, current_sample_rate),
-        daemon=True
-    )
-    stt_thread.start()
 
     try:
         async for message in websocket:
             if isinstance(message, (bytes, bytearray)):
                 chunk = bytes(message)
                 session.add_chunk(chunk)
-                audio_q.put(chunk)
                 
                 if not recording_active:
                     recording_active = True
+                    audio_q = queue.Queue()
+                    stt_thread = threading.Thread(
+                        target=start_stt_thread,
+                        args=(audio_q, websocket, loop, current_sample_rate, session),  # ✅ Pass session
+                        daemon=True
+                    )
+                    stt_thread.start()
                     print("🎙️ Recording started")
+                
+                if audio_q:
+                    audio_q.put(chunk)
+                    
             else:
                 try:
                     data = json.loads(message)
@@ -216,11 +267,23 @@ async def handle_client(websocket):
                         }))
                     elif data.get("type") == "recording_stopped":
                         print("🛑 Recording stopped")
+                        if recording_active and audio_q:
+                            audio_q.put(None)
+                            if stt_thread:
+                                stt_thread.join(timeout=3.0)
+                        
+                        # ✅ NEW: Generate summary
+                        print("🤖 Generating summary...")
+                        summary_result = generate_summary(session.transcripts)
+                        
                         recording_active = False
-                        audio_q.put(None)
+                        audio_q = None
+                        stt_thread = None
+                        
                         await websocket.send(json.dumps({
                             "type": "recording_stopped_ack",
-                            "message": "Recording stopped"
+                            "message": "Recording stopped",
+                            "summary": summary_result  # ✅ Send summary
                         }))
                     elif data.get("type") == "recording_complete":
                         stats = session.get_stats()
@@ -237,14 +300,16 @@ async def handle_client(websocket):
     except Exception as e:
         print(f"❌ Error: {e}")
     finally:
-        if recording_active:
+        if recording_active and audio_q:
             audio_q.put(None)
-        stt_thread.join(timeout=3.0)
+        if stt_thread:
+            stt_thread.join(timeout=3.0)
         if session_id in sessions:
             stats = sessions[session_id].get_stats()
             print(f"\n🔴 Disconnected: {stats['total_mb']} MB, {stats['duration_seconds']}s")
             del sessions[session_id]
-
+            
+            
 async def main():
     host = "localhost"
     port = 8765

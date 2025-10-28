@@ -1,10 +1,11 @@
 // App.jsx
-// Multi-speaker, multi-language live transcription
+// Multi-speaker, multi-language live transcription with Meeting Mode Selection
 
 import React, { useState, useRef, useEffect } from "react";
 import "./App.css";
 
 function App() {
+  const [recordingMode, setRecordingMode] = useState("online"); // "online" or "in-person"
   const [recording, setRecording] = useState(false);
   const [videoURL, setVideoURL] = useState(null);
   const [status, setStatus] = useState("");
@@ -12,6 +13,7 @@ function App() {
   const [recordingSize, setRecordingSize] = useState(0);
   const [wsConnected, setWsConnected] = useState(false);
   const [wsStatus, setWsStatus] = useState("Disconnected");
+  const [summary, setSummary] = useState(null);
 
   // Transcription state
   const [finalLines, setFinalLines] = useState([]);
@@ -77,6 +79,7 @@ function App() {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data);
+          
           if (data.type === "transcript") {
             const speaker = data.speaker || "Speaker";
             const language = data.language_name || data.language || "Unknown";
@@ -99,12 +102,25 @@ function App() {
                 console.log(`   Confidence: ${(confidence * 100).toFixed(1)}%`);
               }
             } else {
-              setInterimText(`[${language}] ${speaker}: ${(data.text || "").trim()}`);
+              setInterimText(`${speaker}: ${(data.text || "").trim()}`);
               console.log(`⏳ INTERIM [${language}] ${speaker}: ${data.text}`);
             }
+          } 
+          else if (data.type === "recording_stopped_ack") {
+            console.log("🛑 Recording stopped acknowledged");
+            if (data.summary) {
+              setSummary(data.summary);
+              console.log("📋 Summary received:", data.summary);
+            }
+          }
+          else if (data.type === "connected") {
+            console.log("✅ Connected to server:", data.message);
+          } else if (data.type === "audio_format_ack") {
+            console.log("✅ Audio format acknowledged");
+          } else if (data.type === "recording_saved") {
+            console.log("✅ Recording saved:", data.stats);
           }
         } catch (err) {
-          // Non-JSON or other message types ignored
           console.error("WebSocket message error:", err);
         }
       };
@@ -138,113 +154,118 @@ function App() {
       setDuration(0);
       setRecordingSize(0);
 
-      // Get microphone
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = micStream;
-
-      // Get screen + system audio
-      const screenStream = await navigator.mediaDevices.getDisplayMedia({
-        video: { cursor: "always" },
-        audio: true,
-      });
-      screenStreamRef.current = screenStream;
-
-      // AudioContext setup
       const audioContext = new (window.AudioContext || window.webkitAudioContext)();
       audioContextRef.current = audioContext;
       sampleRateRef.current = audioContext.sampleRate;
       console.log(`🎵 AudioContext sample rate: ${audioContext.sampleRate}Hz`);
       
       const destination = audioContext.createMediaStreamDestination();
-
-      // Mixing bus for local recording (mic + system)
       const mixingBus = audioContext.createGain();
       mixingBus.gain.value = 1.0;
       mixingBusRef.current = mixingBus;
+
+      // Get microphone
+      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      micStreamRef.current = micStream;
 
       const micSource = audioContext.createMediaStreamSource(micStream);
       const micGain = audioContext.createGain();
       micGain.gain.value = 1.0;
       micSource.connect(micGain).connect(mixingBus);
 
-      if (screenStream.getAudioTracks().length > 0) {
-        const screenSource = audioContext.createMediaStreamSource(screenStream);
-        const screenGain = audioContext.createGain();
-        screenGain.gain.value = 1.0;
-        screenSource.connect(screenGain).connect(mixingBus);
-        console.log("✅ System audio detected and connected");
+      // If online meeting, get screen + system audio
+      if (recordingMode === "online") {
+        const screenStream = await navigator.mediaDevices.getDisplayMedia({
+          video: { cursor: "always" },
+          audio: true,
+        });
+        screenStreamRef.current = screenStream;
+
+        if (screenStream.getAudioTracks().length > 0) {
+          const screenSource = audioContext.createMediaStreamSource(screenStream);
+          const screenGain = audioContext.createGain();
+          screenGain.gain.value = 1.0;
+          screenSource.connect(screenGain).connect(mixingBus);
+          console.log("✅ System audio detected and connected");
+        } else {
+          console.warn("⚠️ No system audio detected");
+        }
+
+        mixingBus.connect(destination);
+
+        // Combine video + mixed audio for local recording
+        const combinedStream = new MediaStream([
+          ...screenStream.getVideoTracks(),
+          ...destination.stream.getAudioTracks(),
+        ]);
+        streamRef.current = combinedStream;
+
+        // Audio visualizers for online mode
+        micAnalyserRef.current = audioContext.createAnalyser();
+        const micSourceForVis = audioContext.createMediaStreamSource(micStream);
+        micSourceForVis.connect(micAnalyserRef.current);
+
+        if (screenStream.getAudioTracks().length > 0) {
+          systemAnalyserRef.current = audioContext.createAnalyser();
+          const systemSourceForVis = audioContext.createMediaStreamSource(screenStream);
+          systemSourceForVis.connect(systemAnalyserRef.current);
+        }
+
+        visualizeAudioLevels();
       } else {
-        console.warn("⚠️ No system audio detected");
+        // In-person mode: just microphone, no visualizer
+        mixingBus.connect(destination);
+        streamRef.current = destination.stream;
       }
 
-      // Connect mixing bus to local recorder destination
-      mixingBus.connect(destination);
+      // Local video recorder (only for online mode)
+      if (recordingMode === "online") {
+        const mimeType = getSupportedMimeType();
+        const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType });
+        mediaRecorderRef.current = mediaRecorder;
+        chunksRef.current = [];
 
-      // Combine video + mixed audio for local recording
-      const combinedStream = new MediaStream([
-        ...screenStream.getVideoTracks(),
-        ...destination.stream.getAudioTracks(),
-      ]);
-      streamRef.current = combinedStream;
+        mediaRecorder.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            chunksRef.current.push(event.data);
+            setRecordingSize((prev) => prev + event.data.size);
+          }
+        };
 
-      // Audio visualizers
-      micAnalyserRef.current = audioContext.createAnalyser();
-      const micSourceForVis = audioContext.createMediaStreamSource(micStream);
-      micSourceForVis.connect(micAnalyserRef.current);
+        mediaRecorder.onstop = async () => {
+          const blob = new Blob(chunksRef.current, { type: mimeType });
+          const url = URL.createObjectURL(blob);
 
-      if (screenStream.getAudioTracks().length > 0) {
-        systemAnalyserRef.current = audioContext.createAnalyser();
-        const systemSourceForVis = audioContext.createMediaStreamSource(screenStream);
-        systemSourceForVis.connect(systemAnalyserRef.current);
+          if (videoURL) URL.revokeObjectURL(videoURL);
+          setVideoURL(url);
+
+          setStatus("Recording complete");
+
+          // Auto-download
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `recording_${Date.now()}.webm`;
+          a.click();
+
+          // Notify server
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            wsRef.current.send(JSON.stringify({
+              type: "recording_complete",
+              timestamp: Date.now(),
+              total_size: recordingSize,
+              duration: duration
+            }));
+          }
+        };
+
+        mediaRecorder.start(1000);
       }
 
-      visualizeAudioLevels();
-
-      // Local video recorder
-      const mimeType = getSupportedMimeType();
-      const mediaRecorder = new MediaRecorder(combinedStream, { mimeType });
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
-
-      mediaRecorder.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data);
-          setRecordingSize((prev) => prev + event.data.size);
-        }
-      };
-
-      mediaRecorder.onstop = async () => {
-        const blob = new Blob(chunksRef.current, { type: mimeType });
-        const url = URL.createObjectURL(blob);
-
-        if (videoURL) URL.revokeObjectURL(videoURL);
-        setVideoURL(url);
-
-        setStatus("Recording complete");
-
-        // Auto-download
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `recording_${Date.now()}.webm`;
-        a.click();
-
-        // Notify server
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({
-            type: "recording_complete",
-            timestamp: Date.now(),
-            total_size: recordingSize,
-            duration: duration
-          }));
-        }
-      };
-
-      // PCM streaming to backend (mixed audio)
+      // PCM streaming to backend
       await initPcmWorklet(audioContext);
       const workletNode = new AudioWorkletNode(audioContext, "pcm-encoder");
       workletNodeRef.current = workletNode;
 
-      // Connect mixed audio to worklet for STT
       mixingBus.connect(workletNode);
 
       const bytesPerSample = 2;
@@ -259,7 +280,6 @@ function App() {
         pcmByteBufferRef.current.push(u8);
         pcmBufferedBytesRef.current += u8.byteLength;
 
-        // Log every ~10KB
         if (pcmBufferedBytesRef.current % 10000 < u8.byteLength) {
           console.log(`📤 Buffered ${pcmBufferedBytesRef.current} bytes`);
         }
@@ -278,7 +298,6 @@ function App() {
         }
       };
 
-      mediaRecorder.start(1000);
       setRecording(true);
       setStatus(`Recording... (streaming PCM ${sampleRateRef.current}Hz mono)`);
 
@@ -287,7 +306,10 @@ function App() {
       setInterimText("");
 
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
-      screenStream.getVideoTracks()[0].addEventListener("ended", stopRecording);
+
+      if (recordingMode === "online" && screenStreamRef.current) {
+        screenStreamRef.current.getVideoTracks()[0].addEventListener("ended", stopRecording);
+      }
     } catch (err) {
       console.error("Recording error:", err);
       setStatus("Error: " + err.message);
@@ -297,7 +319,6 @@ function App() {
   const stopRecording = () => {
     console.log("🛑 Stopping recording...");
     
-    // ✅ ADDED: Notify backend that recording is stopping
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
         wsRef.current.send(JSON.stringify({
@@ -310,12 +331,10 @@ function App() {
       }
     }
     
-    // Stop local recorder
     if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
       mediaRecorderRef.current.stop();
     }
 
-    // Tear down PCM worklet & buffers
     try {
       if (mixingBusRef.current && workletNodeRef.current) {
         mixingBusRef.current.disconnect(workletNodeRef.current);
@@ -327,7 +346,6 @@ function App() {
     pcmByteBufferRef.current = [];
     pcmBufferedBytesRef.current = 0;
 
-    // Stop streams
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
     if (micStreamRef.current) micStreamRef.current.getTracks().forEach((t) => t.stop());
     if (screenStreamRef.current) screenStreamRef.current.getTracks().forEach((t) => t.stop());
@@ -473,14 +491,41 @@ function App() {
       <div className="left-pane">
         <div className="app-content">
           <div className="app-header">
-            <h1 className="app-title">Screen Recorder</h1>
-            <p className="app-subtitle">Record screen with microphone and system audio</p>
+            <h1 className="app-title">Meeting Recorder</h1>
+            <p className="app-subtitle">Record and transcribe with live speech recognition</p>
           </div>
 
           <div className="ws-status">
-            <div className={`ws-indicator ${wsConnected ? 'connected' : 'disconnected'}`}>
-              </div>
+            <div className={`ws-indicator ${wsConnected ? 'connected' : 'disconnected'}`}></div>
             <span className="ws-status-text">{wsStatus}</span>
+          </div>
+
+          <div className="mode-selector">
+            <div className="mode-label">Choose Meeting Type</div>
+            <div className="mode-buttons">
+              <button
+                onClick={() => setRecordingMode("online")}
+                disabled={recording || !wsConnected}
+                className={`mode-btn online ${recordingMode === "online" ? "selected" : ""}`}
+              >
+                <div className="mode-btn-icon">🖥️</div>
+                <div className="mode-btn-text">
+                  <div className="mode-btn-title">Online Meeting</div>
+                  <div className="mode-btn-desc">Screen + Audio</div>
+                </div>
+              </button>
+              <button
+                onClick={() => setRecordingMode("in-person")}
+                disabled={recording || !wsConnected}
+                className={`mode-btn in-person ${recordingMode === "in-person" ? "selected" : ""}`}
+              >
+                <div className="mode-btn-icon">🎤</div>
+                <div className="mode-btn-text">
+                  <div className="mode-btn-title">In-Person Meeting</div>
+                  <div className="mode-btn-desc">Microphone Only</div>
+                </div>
+              </button>
+            </div>
           </div>
 
           <div className="control-section">
@@ -502,14 +547,17 @@ function App() {
             )}
           </div>
 
-          <div className="visualizer-container">
-            <canvas
-              ref={canvasRef}
-              width={350}
-              height={100}
-              className="visualizer-canvas"
-            />
-          </div>
+          {recordingMode === "online" && (
+            <div className="visualizer-container">
+              <div className="visualizer-label">Audio Levels</div>
+              <canvas
+                ref={canvasRef}
+                width={350}
+                height={100}
+                className="visualizer-canvas"
+              />
+            </div>
+          )}
 
           {recording && (
             <div className="stats-container">
@@ -540,13 +588,25 @@ function App() {
               />
             </div>
           )}
+
+          <div className="summary-section">
+            <h3 className="summary-title">📋 Summary</h3>
+            <div className="summary-content">
+              {summary && summary.summary ? (
+                <pre className="summary-text">{summary.summary}</pre>
+              ) : (
+                <div className="empty-summary">
+                  <p>No summary yet. Stop recording to generate a summary.</p>
+                </div>
+              )}
+            </div>
+          </div>
         </div>
       </div>
 
       <div className="right-pane">
         <div className="transcript-header">
-          <h2>Live Transcription</h2>
-          <span className="tiny-note">Google STT • Multi-Speaker • EN/JP</span>
+          <h2 className="transcript-title">Live Transcription</h2>
         </div>
 
         <div className="transcript-body">
@@ -554,12 +614,6 @@ function App() {
             <div className="transcript-line" key={line.id}>
               <div className="speaker-info">
                 <span className="speaker">{line.speaker}</span>
-                {line.language && (
-                  <span className="language-badge">{line.language}</span>
-                )}
-                {line.confidence && (
-                  <span className="confidence">{(line.confidence * 100).toFixed(0)}%</span>
-                )}
               </div>
               <span className="text">{line.text}</span>
             </div>
@@ -573,9 +627,7 @@ function App() {
           
           {finalLines.length === 0 && !interimText && (
             <div className="empty-state">
-              <p>🎤 Start speaking to see live transcription...</p>
-              <p className="hint">Supports English and Japanese</p>
-              <p className="hint">Detects 2-6 speakers automatically</p>
+              <p className="empty-state-main">🎤 Start speaking to see live transcription</p>
             </div>
           )}
         </div>
