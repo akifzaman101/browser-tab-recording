@@ -99,17 +99,16 @@ python websocket_backend.py
 ## File Structure
 
 ```
-project/
-├── frontend/
-│   ├── src/
-│   │   ├── App.jsx        # Main React component
-│   │   ├── App.css        # Styling
-│   │   └── index.js
-│   └── package.json
+frontend/
+├── src/
+│   ├── App.jsx            # Main React component
+│   ├── App.css            # Styling
+│   └── index.js
 ├── backend/
 │   ├── websocket_backend.py
-│   └── requirements.txt
-├── received_recordings/   # Saved audio files
+│   ├── requirements.txt
+│   └── received_recordings/   # Saved audio files
+├── package.json
 └── README.md
 ```
 
