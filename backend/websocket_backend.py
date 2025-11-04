@@ -1,5 +1,5 @@
 # websocket_backend.py
-# Multi-speaker diarization + English/Japanese transcription
+# Multi-speaker diarization + English/Japanese transcription (v2 API)
 
 import asyncio
 import websockets
@@ -9,7 +9,8 @@ import os
 from typing import Optional
 from collections import Counter
 from openai import OpenAI
-from google.cloud import speech_v1p1beta1 as speech
+from google.cloud.speech_v2 import SpeechClient
+from google.cloud.speech_v2.types import cloud_speech
 import threading
 import queue
 from dotenv import load_dotenv
@@ -19,13 +20,17 @@ load_dotenv("../.env")
 SAVE_DIR = "received_recordings"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
+PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
+if not PROJECT_ID:
+    raise ValueError("GOOGLE_CLOUD_PROJECT environment variable is not set. Please set it in your .env file.")
+
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 class RecordingSession:
     def __init__(self, session_id, file_ext="raw"):
         self.session_id = session_id
         self.chunks = []
-        self.transcripts = []  # ✅ NEW: Store transcripts
+        self.transcripts = []
         self.total_bytes = 0
         self.start_time = datetime.now()
         self.filepath = os.path.join(SAVE_DIR, f"recording_{session_id}.{file_ext}")
@@ -36,7 +41,7 @@ class RecordingSession:
         with open(self.filepath, "ab") as f:
             f.write(chunk_data)
     
-    def add_transcript(self, speaker: str, text: str, language: str):  # ✅ NEW
+    def add_transcript(self, speaker: str, text: str, language: str):
         """Add a final transcript line."""
         self.transcripts.append({
             "speaker": speaker,
@@ -54,37 +59,59 @@ class RecordingSession:
             "total_mb": round(self.total_bytes / (1024 * 1024), 2),
             "duration_seconds": round(duration, 2),
             "filepath": self.filepath,
-            "transcript_lines": len(self.transcripts)  # ✅ NEW
+            "transcript_lines": len(self.transcripts)
         }
 
 sessions = {}
-speech_client = speech.SpeechClient()
+speech_client = SpeechClient()
 
-def build_streaming_config(sample_rate: int = 48000) -> speech.StreamingRecognitionConfig:
-    diarization_config = speech.SpeakerDiarizationConfig(
-        enable_speaker_diarization=True,
-        min_speaker_count=2,
-        max_speaker_count=2,
+RECOGNIZER_ID = "diarization-recognizer"
+RECOGNIZER_PATH = f"projects/{PROJECT_ID}/locations/global/recognizers/{RECOGNIZER_ID}"
+
+def ensure_recognizer_exists():
+    """Create recognizer if it doesn't exist."""
+    try:
+        speech_client.get_recognizer(name=RECOGNIZER_PATH)
+        print(f"✅ Using existing recognizer: {RECOGNIZER_ID}")
+    except Exception:
+        print(f"🔨 Creating recognizer: {RECOGNIZER_ID}")
+        try:
+            request = cloud_speech.CreateRecognizerRequest(
+                parent=f"projects/{PROJECT_ID}/locations/global",
+                recognizer_id=RECOGNIZER_ID,
+                recognizer=cloud_speech.Recognizer(
+                    language_codes=["en-US", "ja-JP"],
+                    model="long",
+                ),
+            )
+            operation = speech_client.create_recognizer(request=request)
+            operation.result(timeout=300)
+            print(f"✅ Recognizer created: {RECOGNIZER_ID}")
+        except Exception as e:
+            print(f"❌ Failed to create recognizer: {e}")
+            raise
+
+def build_streaming_config(sample_rate: int = 48000) -> cloud_speech.StreamingRecognitionConfig:
+    recognition_config = cloud_speech.RecognitionConfig(
+        explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+            encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=sample_rate,
+            audio_channel_count=1,
+        ),
+        language_codes=["en-US", "ja-JP"],
+        model="long",
+        features=cloud_speech.RecognitionFeatures(
+            enable_automatic_punctuation=True,
+            enable_word_time_offsets=True,
+            enable_word_confidence=True,
+        ),
     )
     
-    rec_config = speech.RecognitionConfig(
-        encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-        sample_rate_hertz=sample_rate,
-        audio_channel_count=1,
-        language_code="en-US",
-        alternative_language_codes=["ja-JP"],
-        enable_automatic_punctuation=True,
-        diarization_config=diarization_config,
-        model="default",
-        use_enhanced=True,
-        enable_word_time_offsets=True,
-        enable_word_confidence=True,
-    )
-    
-    return speech.StreamingRecognitionConfig(
-        config=rec_config,
-        interim_results=True,
-        single_utterance=False,
+    return cloud_speech.StreamingRecognitionConfig(
+        config=recognition_config,
+        streaming_features=cloud_speech.StreamingRecognitionFeatures(
+            interim_results=True,
+        ),
     )
     
 def generate_summary(transcripts: list) -> dict:
@@ -92,7 +119,6 @@ def generate_summary(transcripts: list) -> dict:
     if not transcripts:
         return {"summary": "No transcription available", "key_points": []}
     
-    # Combine all transcripts
     full_text = "\n".join([f"{t['speaker']}: {t['text']}" for t in transcripts])
     
     try:
@@ -114,22 +140,25 @@ def generate_summary(transcripts: list) -> dict:
         print(f"❌ Summary generation failed: {e}")
         return {"summary": None, "error": str(e)}
 
-    
-
 def start_stt_thread(
     audio_q: "queue.Queue[Optional[bytes]]",
     websocket: websockets.WebSocketServerProtocol,
     loop: asyncio.AbstractEventLoop,
     sample_rate: int,
-    session: RecordingSession,  # ✅ NEW: Pass session
+    session: RecordingSession,
 ):
     print(f"🎤 STT thread started ({sample_rate}Hz, EN/JP, 2 speakers)")
     
     while True:
         streaming_config = build_streaming_config(sample_rate)
         
-        def audio_generator():
+        def request_generator():
             chunk_count = 0
+            yield cloud_speech.StreamingRecognizeRequest(
+                recognizer=RECOGNIZER_PATH,
+                streaming_config=streaming_config,
+            )
+            
             while True:
                 try:
                     chunk = audio_q.get(timeout=1.0)
@@ -138,17 +167,12 @@ def start_stt_thread(
                         return
                     if len(chunk) > 0:
                         chunk_count += 1
-                        yield chunk
+                        yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
                 except queue.Empty:
                     continue
         
         try:
-            requests = (
-                speech.StreamingRecognizeRequest(audio_content=content)
-                for content in audio_generator()
-            )
-            
-            responses = speech_client.streaming_recognize(streaming_config, requests)
+            responses = speech_client.streaming_recognize(requests=request_generator())
             print("📊 STT stream active")
             
             for response in responses:
@@ -163,19 +187,18 @@ def start_stt_thread(
                     transcript = alt.transcript or ""
                     is_final = bool(result.is_final)
                     
-                    detected_language = getattr(alt, 'language', "en-US")
+                    detected_language = result.language_code if hasattr(result, 'language_code') else "en-US"
                     language_name = "English" if detected_language.startswith("en") else "Japanese" if detected_language.startswith("ja") else detected_language
                     
                     speaker_tag = None
                     if alt.words and len(alt.words) > 0:
-                        speaker_tags = [getattr(word, "speaker_tag", None) or getattr(word, "speakerTag", None) for word in alt.words if getattr(word, "speaker_tag", None) or getattr(word, "speakerTag", None)]
+                        speaker_tags = [word.speaker_label for word in alt.words if hasattr(word, 'speaker_label') and word.speaker_label]
                         if speaker_tags:
                             speaker_tag = Counter(speaker_tags).most_common(1)[0][0]
                     
                     speaker_label = f"Speaker {speaker_tag}" if speaker_tag else "Speaker"
-                    confidence = getattr(alt, 'confidence', None) if is_final else None
+                    confidence = alt.confidence if is_final and hasattr(alt, 'confidence') else None
                     
-                    # ✅ NEW: Store final transcripts in session
                     if is_final and transcript.strip():
                         session.add_transcript(speaker_label, transcript, language_name)
                     
@@ -210,8 +233,6 @@ def start_stt_thread(
     
     print("🎤 STT thread exiting")
 
-
-
 async def handle_client(websocket):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     session = RecordingSession(session_id, file_ext="raw")
@@ -243,7 +264,7 @@ async def handle_client(websocket):
                     audio_q = queue.Queue()
                     stt_thread = threading.Thread(
                         target=start_stt_thread,
-                        args=(audio_q, websocket, loop, current_sample_rate, session),  # ✅ Pass session
+                        args=(audio_q, websocket, loop, current_sample_rate, session),
                         daemon=True
                     )
                     stt_thread.start()
@@ -272,7 +293,6 @@ async def handle_client(websocket):
                             if stt_thread:
                                 stt_thread.join(timeout=3.0)
                         
-                        # ✅ NEW: Generate summary
                         print("🤖 Generating summary...")
                         summary_result = generate_summary(session.transcripts)
                         
@@ -283,7 +303,7 @@ async def handle_client(websocket):
                         await websocket.send(json.dumps({
                             "type": "recording_stopped_ack",
                             "message": "Recording stopped",
-                            "summary": summary_result  # ✅ Send summary
+                            "summary": summary_result
                         }))
                     elif data.get("type") == "recording_complete":
                         stats = session.get_stats()
@@ -309,7 +329,6 @@ async def handle_client(websocket):
             print(f"\n🔴 Disconnected: {stats['total_mb']} MB, {stats['duration_seconds']}s")
             del sessions[session_id]
             
-            
 async def main():
     host = "localhost"
     port = 8765
@@ -317,7 +336,10 @@ async def main():
     print(f"🚀 WebSocket Server Starting...")
     print(f"📡 Listening on ws://{host}:{port}")
     print(f"📁 Recordings: {os.path.abspath(SAVE_DIR)}")
-    print(f"🌍 EN/JP (Chirp) • 2 speakers\n")
+    print(f"🌐 EN/JP (v2 API) • 2 speakers\n")
+    
+    # Ensure recognizer exists before starting server
+    ensure_recognizer_exists()
     
     async with websockets.serve(handle_client, host, port, max_size=10 * 1024 * 1024):
         await asyncio.Future()
