@@ -60,19 +60,19 @@ class RecordingSession:
 sessions = {}
 speech_client = speech.SpeechClient()
 
-def build_streaming_config(sample_rate: int = 48000) -> speech.StreamingRecognitionConfig:
+def build_streaming_config(sample_rate: int = 16000) -> speech.StreamingRecognitionConfig:
     diarization_config = speech.SpeakerDiarizationConfig(
         enable_speaker_diarization=True,
         min_speaker_count=2,
-        max_speaker_count=2,
+        max_speaker_count=6,
     )
     
     rec_config = speech.RecognitionConfig(
         encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
         sample_rate_hertz=sample_rate,
         audio_channel_count=1,
-        language_code="en-US",
-        alternative_language_codes=["ja-JP"],
+        language_code="ja-JP",
+        alternative_language_codes=["en-US"],
         enable_automatic_punctuation=True,
         diarization_config=diarization_config,
         model="default",
@@ -218,7 +218,7 @@ async def handle_client(websocket):
     sessions[session_id] = session
 
     audio_q: "queue.Queue[Optional[bytes]]" = None
-    current_sample_rate = 48000
+    current_sample_rate = 16000
     recording_active = False
     stt_thread = None
 
@@ -319,7 +319,16 @@ async def main():
     print(f"📁 Recordings: {os.path.abspath(SAVE_DIR)}")
     print(f"🌍 EN/JP (Chirp) • 2 speakers\n")
     
-    async with websockets.serve(handle_client, host, port, max_size=10 * 1024 * 1024):
+    async def wrapped_handler(websocket):
+        try:
+            await handle_client(websocket)
+        except websockets.exceptions.ConnectionClosedError:
+            # Silently ignore connection errors during handshake
+            pass
+        except Exception as e:
+            print(f"❌ Unexpected error: {e}")
+    
+    async with websockets.serve(wrapped_handler, host, port, max_size=10 * 1024 * 1024):
         await asyncio.Future()
 
 if __name__ == "__main__":

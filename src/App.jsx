@@ -41,7 +41,7 @@ function App() {
   const pcmBufferedBytesRef = useRef(0);
   const desiredChunkMs = 20;
   const desiredBytesPerChunkRef = useRef(0);
-  const sampleRateRef = useRef(48000);
+  const sampleRateRef = useRef(16000);
 
   useEffect(() => {
     connectWebSocket();
@@ -154,7 +154,9 @@ function App() {
       setDuration(0);
       setRecordingSize(0);
 
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 16000
+      });
       audioContextRef.current = audioContext;
       sampleRateRef.current = audioContext.sampleRate;
       console.log(`🎵 AudioContext sample rate: ${audioContext.sampleRate}Hz`);
