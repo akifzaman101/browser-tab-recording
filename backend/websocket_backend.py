@@ -60,7 +60,7 @@ class RecordingSession:
 sessions = {}
 speech_client = speech.SpeechClient()
 
-def build_streaming_config(sample_rate: int = 16000) -> speech.StreamingRecognitionConfig:
+def build_streaming_config(sample_rate: int = 48000) -> speech.StreamingRecognitionConfig:
     diarization_config = speech.SpeakerDiarizationConfig(
         enable_speaker_diarization=True,
         min_speaker_count=2,
@@ -218,7 +218,7 @@ async def handle_client(websocket):
     sessions[session_id] = session
 
     audio_q: "queue.Queue[Optional[bytes]]" = None
-    current_sample_rate = 16000
+    current_sample_rate = 48000
     recording_active = False
     stt_thread = None
 

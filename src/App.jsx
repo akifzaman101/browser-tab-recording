@@ -41,7 +41,7 @@ function App() {
   const pcmBufferedBytesRef = useRef(0);
   const desiredChunkMs = 20;
   const desiredBytesPerChunkRef = useRef(0);
-  const sampleRateRef = useRef(16000);
+  const sampleRateRef = useRef(48000);
 
   useEffect(() => {
     connectWebSocket();
@@ -55,7 +55,8 @@ function App() {
 
   const connectWebSocket = () => {
     try {
-      const ws = new WebSocket("ws://localhost:8765");
+      // const ws = new WebSocket("ws://localhost:8765");
+      const ws = new WebSocket("ws://localhost:8000/ws/transcribe/");
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
@@ -155,7 +156,7 @@ function App() {
       setRecordingSize(0);
 
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({
-        sampleRate: 16000
+        sampleRate: 48000
       });
       audioContextRef.current = audioContext;
       sampleRateRef.current = audioContext.sampleRate;
