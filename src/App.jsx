@@ -1,11 +1,11 @@
 // App.jsx
-// Multi-speaker, multi-language live transcription with Meeting Mode Selection
+// Multi-speaker, multi-language live transcription with Post-Processing Upload
 
 import React, { useState, useRef, useEffect } from "react";
 import "./App.css";
 
 function App() {
-  const [recordingMode, setRecordingMode] = useState("online"); // "online" or "in-person"
+  const [recordingMode, setRecordingMode] = useState("online");
   const [recording, setRecording] = useState(false);
   const [videoURL, setVideoURL] = useState(null);
   const [status, setStatus] = useState("");
@@ -18,6 +18,14 @@ function App() {
   // Transcription state
   const [finalLines, setFinalLines] = useState([]);
   const [interimText, setInterimText] = useState("");
+
+  // Post-processing state
+  const [postProcessingTranscripts, setPostProcessingTranscripts] = useState([]);
+  const [postProcessingSummary, setPostProcessingSummary] = useState(null);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [uploadError, setUploadError] = useState(null);
 
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -33,6 +41,7 @@ function App() {
   const canvasRef = useRef(null);
 
   const wsRef = useRef(null);
+  const fileInputRef = useRef(null);
 
   // PCM streaming refs
   const mixingBusRef = useRef(null);
@@ -110,8 +119,20 @@ function App() {
             console.log("🛑 Recording stopped acknowledged");
             if (data.summary) {
               setSummary(data.summary);
-              console.log("📋 Summary received:", data.summary);
+              console.log("📋 Real-time Summary received:", data.summary);
             }
+          }
+          else if (data.type === "post_processing_complete") {
+            console.log("✅ Post-processing complete!");
+            setIsProcessing(false);
+            setPostProcessingTranscripts(data.transcripts || []);
+            setPostProcessingSummary(data.summary);
+            setStatus("Post-processing complete! Check the Post-Processed Transcription tab.");
+          }
+          else if (data.type === "post_processing_error") {
+            console.error("❌ Post-processing error:", data.error);
+            setIsProcessing(false);
+            setStatus(`Post-processing error: ${data.error}`);
           }
           else if (data.type === "connected") {
             console.log("✅ Connected to server:", data.message);
@@ -164,7 +185,6 @@ function App() {
       mixingBus.gain.value = 1.0;
       mixingBusRef.current = mixingBus;
 
-      // Get microphone
       const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
       micStreamRef.current = micStream;
 
@@ -173,7 +193,6 @@ function App() {
       micGain.gain.value = 1.0;
       micSource.connect(micGain).connect(mixingBus);
 
-      // If online meeting, get screen + system audio
       if (recordingMode === "online") {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: { cursor: "always" },
@@ -193,14 +212,12 @@ function App() {
 
         mixingBus.connect(destination);
 
-        // Combine video + mixed audio for local recording
         const combinedStream = new MediaStream([
           ...screenStream.getVideoTracks(),
           ...destination.stream.getAudioTracks(),
         ]);
         streamRef.current = combinedStream;
 
-        // Audio visualizers for online mode
         micAnalyserRef.current = audioContext.createAnalyser();
         const micSourceForVis = audioContext.createMediaStreamSource(micStream);
         micSourceForVis.connect(micAnalyserRef.current);
@@ -213,12 +230,10 @@ function App() {
 
         visualizeAudioLevels();
       } else {
-        // In-person mode: just microphone, no visualizer
         mixingBus.connect(destination);
         streamRef.current = destination.stream;
       }
 
-      // Local video recorder (only for online mode)
       if (recordingMode === "online") {
         const mimeType = getSupportedMimeType();
         const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType });
@@ -239,15 +254,13 @@ function App() {
           if (videoURL) URL.revokeObjectURL(videoURL);
           setVideoURL(url);
 
-          setStatus("Recording complete");
+          setStatus("Recording complete - Starting post-processing...");
 
-          // Auto-download
           const a = document.createElement("a");
           a.href = url;
           a.download = `recording_${Date.now()}.webm`;
           a.click();
 
-          // Notify server
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             wsRef.current.send(JSON.stringify({
               type: "recording_complete",
@@ -261,7 +274,6 @@ function App() {
         mediaRecorder.start(1000);
       }
 
-      // PCM streaming to backend
       await initPcmWorklet(audioContext);
       const workletNode = new AudioWorkletNode(audioContext, "pcm-encoder");
       workletNodeRef.current = workletNode;
@@ -301,7 +313,6 @@ function App() {
       setRecording(true);
       setStatus(`Recording... (streaming PCM ${sampleRateRef.current}Hz mono)`);
 
-      // Reset transcript
       setFinalLines([]);
       setInterimText("");
 
@@ -318,6 +329,9 @@ function App() {
 
   const stopRecording = () => {
     console.log("🛑 Stopping recording...");
+    
+    setIsProcessing(true);
+    setStatus("Stopping recording and starting post-processing...");
     
     if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
       try {
@@ -352,12 +366,71 @@ function App() {
     if (audioContextRef.current) audioContextRef.current.close();
 
     setRecording(false);
-    setStatus("Stopped");
 
     if (timerRef.current) clearInterval(timerRef.current);
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     
     console.log("✅ Recording stopped successfully");
+  };
+
+  const handleFileUpload = async (event) => {
+    const file = event.target.files[0];
+    if (!file) return;
+
+    setIsUploading(true);
+    setIsProcessing(true);
+    setUploadError(null);
+    setUploadProgress(0);
+    setStatus(`Uploading ${file.name}...`);
+
+    const formData = new FormData();
+    formData.append('file', file);
+
+    try {
+      const xhr = new XMLHttpRequest();
+
+      xhr.upload.addEventListener('progress', (e) => {
+        if (e.lengthComputable) {
+          const percentComplete = (e.loaded / e.total) * 100;
+          setUploadProgress(Math.round(percentComplete));
+        }
+      });
+
+      xhr.addEventListener('load', () => {
+        setIsUploading(false);
+        if (xhr.status === 200) {
+          const response = JSON.parse(xhr.responseText);
+          setPostProcessingTranscripts(response.transcripts || []);
+          setPostProcessingSummary(response.summary);
+          setIsProcessing(false);
+          setStatus("Upload and post-processing complete!");
+          console.log("✅ Upload processing complete");
+        } else {
+          const error = JSON.parse(xhr.responseText);
+          setUploadError(error.error || "Upload failed");
+          setIsProcessing(false);
+          setStatus(`Upload failed: ${error.error}`);
+        }
+      });
+
+      xhr.addEventListener('error', () => {
+        setIsUploading(false);
+        setIsProcessing(false);
+        setUploadError("Network error during upload");
+        setStatus("Network error during upload");
+      });
+
+      xhr.open('POST', 'http://localhost:8766/upload');
+      xhr.send(formData);
+    } catch (error) {
+      console.error("Upload error:", error);
+      setIsUploading(false);
+      setIsProcessing(false);
+      setUploadError(error.message);
+      setStatus(`Upload error: ${error.message}`);
+    }
+
+    event.target.value = '';
   };
 
   const getSupportedMimeType = () => {
@@ -492,7 +565,7 @@ function App() {
         <div className="app-content">
           <div className="app-header">
             <h1 className="app-title">Meeting Recorder</h1>
-            <p className="app-subtitle">Record and transcribe with live speech recognition</p>
+            <p className="app-subtitle">Record and transcribe with live speech recognition & Chirp 3 post-processing</p>
           </div>
 
           <div className="ws-status">
@@ -547,6 +620,29 @@ function App() {
             )}
           </div>
 
+          {/* Upload Section */}
+          <div className="upload-section">
+            <div className="upload-label">Or Upload Video for Post-Processing</div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="video/*,audio/*"
+              onChange={handleFileUpload}
+              disabled={isUploading || recording}
+              style={{ display: 'none' }}
+            />
+            <button
+              onClick={() => fileInputRef.current?.click()}
+              disabled={isUploading || recording || !wsConnected}
+              className="upload-btn"
+            >
+              {isUploading ? `Uploading... ${uploadProgress}%` : "📁 Upload Video/Audio"}
+            </button>
+            {uploadError && (
+              <div className="upload-error">❌ {uploadError}</div>
+            )}
+          </div>
+
           {recordingMode === "online" && (
             <div className="visualizer-container">
               <div className="visualizer-label">Audio Levels</div>
@@ -572,6 +668,13 @@ function App() {
             </div>
           )}
 
+          {isProcessing && (
+            <div className="processing-indicator">
+              <div className="spinner"></div>
+              <span>Processing with Google Chirp 3...</span>
+            </div>
+          )}
+
           {status && (
             <div className="status-message">
               <span className="status-text">{status}</span>
@@ -590,7 +693,7 @@ function App() {
           )}
 
           <div className="summary-section">
-            <h3 className="summary-title">📋 Summary</h3>
+            <h3 className="summary-title">📋 Real-Time Summary</h3>
             <div className="summary-content">
               {summary && summary.summary ? (
                 <pre className="summary-text">{summary.summary}</pre>
@@ -605,31 +708,110 @@ function App() {
       </div>
 
       <div className="right-pane">
-        <div className="transcript-header">
-          <h2 className="transcript-title">Live Transcription</h2>
+        <div className="tabs-container">
+          <div className="tabs">
+            <button 
+              className="tab active" 
+              onClick={(e) => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                e.target.classList.add('active');
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                document.getElementById('realtime-tab').classList.add('active');
+              }}
+            >
+              Real-Time
+            </button>
+            <button 
+              className="tab" 
+              onClick={(e) => {
+                document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+                e.target.classList.add('active');
+                document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+                document.getElementById('postprocessing-tab').classList.add('active');
+              }}
+            >
+              Post-Processed (Chirp 3)
+            </button>
+          </div>
         </div>
 
-        <div className="transcript-body">
-          {finalLines.map((line) => (
-            <div className="transcript-line" key={line.id}>
-              <div className="speaker-info">
-                <span className="speaker">{line.speaker}</span>
-              </div>
-              <span className="text">{line.text}</span>
-            </div>
-          ))}
+        {/* Real-Time Transcription Tab */}
+        <div id="realtime-tab" className="tab-content active">
+          <div className="transcript-header">
+            <h2 className="transcript-title">Live Transcription</h2>
+          </div>
 
-          {interimText && (
-            <div className="transcript-line interim">
-              <span className="text">{interimText}</span>
-            </div>
-          )}
-          
-          {finalLines.length === 0 && !interimText && (
-            <div className="empty-state">
-              <p className="empty-state-main">🎤 Start speaking to see live transcription</p>
-            </div>
-          )}
+          <div className="transcript-body">
+            {finalLines.map((line) => (
+              <div className="transcript-line" key={line.id}>
+                <div className="speaker-info">
+                  <span className="speaker">{line.speaker}</span>
+                  <span className="language-badge">{line.language}</span>
+                </div>
+                <span className="text">{line.text}</span>
+              </div>
+            ))}
+
+            {interimText && (
+              <div className="transcript-line interim">
+                <span className="text">{interimText}</span>
+              </div>
+            )}
+            
+            {finalLines.length === 0 && !interimText && (
+              <div className="empty-state">
+                <p className="empty-state-main">🎤 Start speaking to see live transcription</p>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Post-Processing Transcription Tab */}
+        <div id="postprocessing-tab" className="tab-content">
+          <div className="transcript-header">
+            <h2 className="transcript-title">Post-Processed Transcription</h2>
+            <p className="transcript-subtitle">Powered by Google Chirp 3</p>
+          </div>
+
+          <div className="transcript-body">
+            {postProcessingTranscripts.length > 0 ? (
+              <>
+                {postProcessingTranscripts.map((line, index) => (
+                  <div className="transcript-line post-processed" key={index}>
+                    <div className="speaker-info">
+                      <span className="speaker">{line.speaker}</span>
+                      <span className="language-badge">{line.language}</span>
+                      {line.confidence && (
+                        <span className="confidence-badge">
+                          {(line.confidence * 100).toFixed(0)}%
+                        </span>
+                      )}
+                      {line.start_time !== null && line.start_time !== undefined && (
+                        <span className="time-badge">
+                          {formatTime(Math.floor(line.start_time))}
+                        </span>
+                      )}
+                    </div>
+                    <span className="text">{line.text}</span>
+                  </div>
+                ))}
+                
+                {postProcessingSummary && (
+                  <div className="post-summary-section">
+                    <h4 className="post-summary-title">📊 Summary</h4>
+                    <div className="post-summary-content">
+                      <pre className="summary-text">{postProcessingSummary.summary}</pre>
+                    </div>
+                  </div>
+                )}
+              </>
+            ) : (
+              <div className="empty-state">
+                <p className="empty-state-main">🎬 Upload a video or stop recording to see post-processed transcription</p>
+                <p className="empty-state-sub">Post-processing uses Google Chirp 3 for enhanced accuracy and speaker diarization</p>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>

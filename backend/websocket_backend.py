@@ -1,5 +1,6 @@
 # websocket_backend.py
 # Multi-speaker diarization + English/Japanese transcription (v2 API)
+# Now with HTTP upload endpoint and auto post-processing
 
 import asyncio
 import websockets
@@ -14,11 +15,16 @@ from google.cloud.speech_v2.types import cloud_speech
 import threading
 import queue
 from dotenv import load_dotenv
+from aiohttp import web
+import aiohttp_cors
+import post_processing
 
 load_dotenv("../.env")
 
 SAVE_DIR = "received_recordings"
+UPLOAD_DIR = "uploads"
 os.makedirs(SAVE_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 if not PROJECT_ID:
@@ -173,7 +179,7 @@ def start_stt_thread(
         
         try:
             responses = speech_client.streaming_recognize(requests=request_generator())
-            print("📊 STT stream active")
+            print("🔊 STT stream active")
             
             for response in responses:
                 if not response.results:
@@ -232,6 +238,52 @@ def start_stt_thread(
                 break
     
     print("🎤 STT thread exiting")
+
+def post_process_recording_async(filepath, websocket, loop, sample_rate):
+    """Post-process recording in background thread"""
+    try:
+        print(f"\n🔄 Starting auto post-processing for: {filepath}")
+        print(f"📊 Using sample rate: {sample_rate}Hz")
+        
+        # Process the recording with actual sample rate
+        transcripts, summary, error = post_processing.process_file(
+            filepath, 
+            os.path.basename(filepath),
+            is_raw=True,
+            sample_rate=sample_rate  # Use actual sample rate from recording
+        )
+        
+        if error:
+            asyncio.run_coroutine_threadsafe(
+                websocket.send(json.dumps({
+                    "type": "post_processing_error",
+                    "error": error
+                })),
+                loop
+            )
+            return
+        
+        # Send post-processed results
+        asyncio.run_coroutine_threadsafe(
+            websocket.send(json.dumps({
+                "type": "post_processing_complete",
+                "transcripts": transcripts,
+                "summary": summary
+            })),
+            loop
+        )
+        
+        print(f"✅ Auto post-processing complete: {len(transcripts)} segments")
+        
+    except Exception as e:
+        print(f"❌ Auto post-processing failed: {e}")
+        asyncio.run_coroutine_threadsafe(
+            websocket.send(json.dumps({
+                "type": "post_processing_error",
+                "error": str(e)
+            })),
+            loop
+        )
 
 async def handle_client(websocket):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -293,7 +345,7 @@ async def handle_client(websocket):
                             if stt_thread:
                                 stt_thread.join(timeout=3.0)
                         
-                        print("🤖 Generating summary...")
+                        print("🤖 Generating real-time summary...")
                         summary_result = generate_summary(session.transcripts)
                         
                         recording_active = False
@@ -305,6 +357,16 @@ async def handle_client(websocket):
                             "message": "Recording stopped",
                             "summary": summary_result
                         }))
+                        
+                        # Start auto post-processing in background with actual sample rate
+                        print("🚀 Starting auto post-processing...")
+                        post_thread = threading.Thread(
+                            target=post_process_recording_async,
+                            args=(session.filepath, websocket, loop, current_sample_rate),  # Pass current_sample_rate
+                            daemon=True
+                        )
+                        post_thread.start()
+                        
                     elif data.get("type") == "recording_complete":
                         stats = session.get_stats()
                         print(f"🎬 Complete: {stats['total_mb']} MB, {stats['duration_seconds']}s")
@@ -328,17 +390,117 @@ async def handle_client(websocket):
             stats = sessions[session_id].get_stats()
             print(f"\n🔴 Disconnected: {stats['total_mb']} MB, {stats['duration_seconds']}s")
             del sessions[session_id]
+
+# HTTP Handlers for file upload
+async def handle_upload(request):
+    """Handle video/audio file upload for post-processing"""
+    try:
+        reader = await request.multipart()
+        field = await reader.next()
+        
+        if field.name != 'file':
+            return web.json_response({"error": "No file provided"}, status=400)
+        
+        filename = field.filename
+        if not filename:
+            return web.json_response({"error": "No filename"}, status=400)
+        
+        # Save uploaded file
+        file_ext = filename.rsplit('.', 1)[1].lower() if '.' in filename else 'tmp'
+        job_id = str(datetime.now().strftime("%Y%m%d_%H%M%S"))
+        saved_filename = f"upload_{job_id}.{file_ext}"
+        filepath = os.path.join(UPLOAD_DIR, saved_filename)
+        
+        size = 0
+        with open(filepath, 'wb') as f:
+            while True:
+                chunk = await field.read_chunk()
+                if not chunk:
+                    break
+                size += len(chunk)
+                f.write(chunk)
+        
+        print(f"📁 File uploaded: {filename} ({size / (1024*1024):.2f} MB)")
+        
+        # Process in background
+        def process_async():
+            transcripts, summary, error = post_processing.process_file(
+                filepath,
+                filename,
+                is_raw=False
+            )
             
+            # Cleanup uploaded file
+            try:
+                os.remove(filepath)
+            except:
+                pass
+            
+            return transcripts, summary, error
+        
+        loop = asyncio.get_event_loop()
+        transcripts, summary, error = await loop.run_in_executor(None, process_async)
+        
+        if error:
+            return web.json_response({"error": error}, status=500)
+        
+        return web.json_response({
+            "success": True,
+            "transcripts": transcripts,
+            "summary": summary
+        })
+    
+    except Exception as e:
+        print(f"❌ Upload error: {e}")
+        return web.json_response({"error": str(e)}, status=500)
+
+async def handle_health(request):
+    """Health check"""
+    return web.json_response({"status": "healthy"})
+
+async def start_http_server(runner):
+    await runner.setup()
+    site = web.TCPSite(runner, 'localhost', 8766)
+    await site.start()
+    print(f"🌐 HTTP server listening on http://localhost:8766")
+
 async def main():
+    # Setup HTTP server
+    app = web.Application(client_max_size=10*1024*1024*1024)  # 10GB max
+    
+    # Setup CORS
+    cors = aiohttp_cors.setup(app, defaults={
+        "*": aiohttp_cors.ResourceOptions(
+            allow_credentials=True,
+            expose_headers="*",
+            allow_headers="*",
+            allow_methods="*"
+        )
+    })
+    
+    # Add routes
+    app.router.add_post('/upload', handle_upload)
+    app.router.add_get('/health', handle_health)
+    
+    # Configure CORS on all routes
+    for route in list(app.router.routes()):
+        cors.add(route)
+    
+    runner = web.AppRunner(app)
+    
+    # Start HTTP server
+    await start_http_server(runner)
+    
+    # Start WebSocket server
     host = "localhost"
     port = 8765
     
     print(f"🚀 WebSocket Server Starting...")
-    print(f"📡 Listening on ws://{host}:{port}")
+    print(f"📡 WebSocket: ws://{host}:{port}")
     print(f"📁 Recordings: {os.path.abspath(SAVE_DIR)}")
-    print(f"🌐 EN/JP (v2 API) • 2 speakers\n")
+    print(f"📤 Uploads: {os.path.abspath(UPLOAD_DIR)}")
+    print(f"🌐 EN/JP (v2 API) • 2 speakers • Chirp 3 post-processing\n")
     
-    # Ensure recognizer exists before starting server
     ensure_recognizer_exists()
     
     async with websockets.serve(handle_client, host, port, max_size=10 * 1024 * 1024):
