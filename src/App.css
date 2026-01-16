@@ -20,8 +20,9 @@ body {
 .app-page {
   display: flex;
   flex-direction: column;
-  min-height: 100vh;
+  height: 100vh;
   width: 100%;
+  overflow: hidden;
 }
 
 /* ========== TOP SECTION ========== */
@@ -29,14 +30,15 @@ body {
   display: flex;
   flex-direction: column;
   align-items: center;
-  padding: 32px 40px;
+  padding: 24px 40px;
   background: linear-gradient(135deg, #0f172a 0%, #1e1f3f 100%);
   border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+  flex-shrink: 0;
 }
 
 .app-header {
   text-align: center;
-  margin-bottom: 32px;
+  margin-bottom: 20px;
   animation: slideDown 0.6s ease;
 }
 
@@ -52,13 +54,13 @@ body {
 }
 
 .app-title {
-  font-size: 36px;
+  font-size: 32px;
   font-weight: 900;
   background: linear-gradient(135deg, #60a5fa 0%, #a78bfa 100%);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
   background-clip: text;
-  margin-bottom: 8px;
+  margin-bottom: 6px;
   letter-spacing: -0.5px;
 }
 
@@ -73,11 +75,11 @@ body {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 10px 18px;
+  padding: 8px 16px;
   background: rgba(30, 41, 59, 0.6);
   border: 1px solid rgba(148, 163, 184, 0.1);
   border-radius: 8px;
-  margin-bottom: 28px;
+  margin-bottom: 20px;
   backdrop-filter: blur(10px);
 }
 
@@ -117,16 +119,16 @@ body {
 /* Control Row */
 .control-row {
   display: flex;
-  gap: 16px;
-  margin-bottom: 28px;
+  gap: 12px;
+  margin-bottom: 20px;
 }
 
 .control-btn {
-  padding: 16px 32px;
-  font-size: 15px;
+  padding: 12px 24px;
+  font-size: 14px;
   font-weight: 700;
   border: none;
-  border-radius: 12px;
+  border-radius: 10px;
   cursor: pointer;
   transition: all 0.3s ease;
   text-transform: uppercase;
@@ -200,9 +202,9 @@ body {
 .visualizer-container {
   background: rgba(30, 41, 59, 0.4);
   border: 1px solid rgba(148, 163, 184, 0.1);
-  border-radius: 12px;
-  padding: 20px;
-  margin-bottom: 24px;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
   backdrop-filter: blur(10px);
   width: 100%;
   max-width: 400px;
@@ -227,8 +229,8 @@ body {
 .stats-container {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 16px;
-  margin-bottom: 24px;
+  gap: 12px;
+  margin-bottom: 16px;
   width: 100%;
   max-width: 400px;
 }
@@ -264,9 +266,9 @@ body {
 .status-message {
   background: rgba(30, 41, 59, 0.4);
   border: 1px solid rgba(148, 163, 184, 0.1);
-  border-radius: 10px;
-  padding: 14px;
-  margin-bottom: 20px;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 16px;
   text-align: center;
   backdrop-filter: blur(10px);
   width: 100%;
@@ -283,12 +285,12 @@ body {
 .video-preview {
   background: rgba(30, 41, 59, 0.4);
   border: 1px solid rgba(148, 163, 184, 0.1);
-  border-radius: 12px;
-  padding: 20px;
+  border-radius: 10px;
+  padding: 16px;
   backdrop-filter: blur(10px);
   width: 100%;
   max-width: 600px;
-  margin-bottom: 20px;
+  margin-bottom: 16px;
 }
 
 .video-title {

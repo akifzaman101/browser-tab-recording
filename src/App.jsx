@@ -356,25 +356,34 @@ function App() {
   };
 
   const downloadCSV = () => {
-    // Format each service's transcripts with speaker labels
-    const formatTranscript = (serviceData) => {
-      return serviceData.final
-        .map(line => `${line.speaker}: ${line.text}`)
-        .join('\n');
-    };
+    // Find max length among all services
+    const maxLength = Math.max(
+      transcripts.gcp_v1.final.length,
+      transcripts.gcp_v2.final.length,
+      transcripts.aws.final.length
+    );
 
-    const gcpV1Formatted = formatTranscript(transcripts.gcp_v1);
-    const gcpV2Formatted = formatTranscript(transcripts.gcp_v2);
-    const awsFormatted = formatTranscript(transcripts.aws);
+    // Build CSV header with BOM for proper Excel encoding
+    const BOM = '\uFEFF';
+    let csvContent = BOM + "GCP v1,GCP v2,AWS Transcribe\n";
+    
+    // Add each line row by row
+    for (let i = 0; i < maxLength; i++) {
+      const gcpV1Line = transcripts.gcp_v1.final[i];
+      const gcpV2Line = transcripts.gcp_v2.final[i];
+      const awsLine = transcripts.aws.final[i];
+      
+      const gcpV1Text = gcpV1Line ? `${gcpV1Line.speaker}: ${gcpV1Line.text}` : "";
+      const gcpV2Text = gcpV2Line ? `${gcpV2Line.speaker}: ${gcpV2Line.text}` : "";
+      const awsText = awsLine ? `${awsLine.speaker}: ${awsLine.text}` : "";
+      
+      // Escape quotes for CSV
+      const escape = (str) => `"${str.replace(/"/g, '""')}"`;
+      
+      csvContent += `${escape(gcpV1Text)},${escape(gcpV2Text)},${escape(awsText)}\n`;
+    }
 
-    // Escape quotes for CSV
-    const escape = (str) => `"${str.replace(/"/g, '""')}"`;
-
-    // Build CSV with formatted transcripts
-    let csvContent = "GCP v1 Text,GCP v2 Text,AWS Text\n";
-    csvContent += `${escape(gcpV1Formatted)},${escape(gcpV2Formatted)},${escape(awsFormatted)}\n`;
-
-    // Download
+    // Download with UTF-8 BOM for Japanese characters
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
