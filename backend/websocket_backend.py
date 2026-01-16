@@ -1,5 +1,5 @@
-# websocket_backend.py
-# Multi-speaker diarization + English/Japanese transcription (v2 API)
+# unified_transcription_server.py
+# Streams audio to GCP v1, GCP v2, and AWS Transcribe simultaneously
 
 import asyncio
 import websockets
@@ -8,29 +8,36 @@ from datetime import datetime
 import os
 from typing import Optional
 from collections import Counter
-from openai import OpenAI
+from google.cloud import speech_v1p1beta1 as speech_v1
 from google.cloud.speech_v2 import SpeechClient
 from google.cloud.speech_v2.types import cloud_speech
+from amazon_transcribe.client import TranscribeStreamingClient
+from amazon_transcribe.handlers import TranscriptResultStreamHandler
+from amazon_transcribe.model import TranscriptEvent
 import threading
 import queue
 from dotenv import load_dotenv
 
-load_dotenv("../.env")
+load_dotenv()
 
 SAVE_DIR = "received_recordings"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
-if not PROJECT_ID:
-    raise ValueError("GOOGLE_CLOUD_PROJECT environment variable is not set. Please set it in your .env file.")
+AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+if not PROJECT_ID:
+    raise ValueError("GOOGLE_CLOUD_PROJECT environment variable must be set in .env file")
 
 class RecordingSession:
     def __init__(self, session_id, file_ext="raw"):
         self.session_id = session_id
         self.chunks = []
-        self.transcripts = []
+        self.transcripts = {
+            "gcp_v1": [],
+            "gcp_v2": [],
+            "aws": []
+        }
         self.total_bytes = 0
         self.start_time = datetime.now()
         self.filepath = os.path.join(SAVE_DIR, f"recording_{session_id}.{file_ext}")
@@ -41,12 +48,11 @@ class RecordingSession:
         with open(self.filepath, "ab") as f:
             f.write(chunk_data)
     
-    def add_transcript(self, speaker: str, text: str, language: str):
-        """Add a final transcript line."""
-        self.transcripts.append({
+    def add_transcript(self, service: str, speaker: str, text: str):
+        """Add a final transcript line for a specific service."""
+        self.transcripts[service].append({
             "speaker": speaker,
             "text": text,
-            "language": language,
             "timestamp": datetime.now().isoformat()
         })
     
@@ -54,27 +60,34 @@ class RecordingSession:
         duration = (datetime.now() - self.start_time).total_seconds()
         return {
             "session_id": self.session_id,
-            "chunks_received": len(self.chunks),
             "total_bytes": self.total_bytes,
             "total_mb": round(self.total_bytes / (1024 * 1024), 2),
             "duration_seconds": round(duration, 2),
             "filepath": self.filepath,
-            "transcript_lines": len(self.transcripts)
+            "transcript_counts": {
+                "gcp_v1": len(self.transcripts["gcp_v1"]),
+                "gcp_v2": len(self.transcripts["gcp_v2"]),
+                "aws": len(self.transcripts["aws"])
+            }
         }
 
 sessions = {}
-speech_client = SpeechClient()
 
-RECOGNIZER_ID = "diarization-recognizer"
+# Initialize clients
+speech_v1_client = speech_v1.SpeechClient()
+speech_v2_client = SpeechClient()
+
+# GCP v2 Recognizer setup
+RECOGNIZER_ID = "unified-recognizer"
 RECOGNIZER_PATH = f"projects/{PROJECT_ID}/locations/global/recognizers/{RECOGNIZER_ID}"
 
-def ensure_recognizer_exists():
-    """Create recognizer if it doesn't exist."""
+def ensure_gcp_v2_recognizer():
+    """Ensure GCP v2 recognizer exists."""
     try:
-        speech_client.get_recognizer(name=RECOGNIZER_PATH)
-        print(f"✅ Using existing recognizer: {RECOGNIZER_ID}")
+        speech_v2_client.get_recognizer(name=RECOGNIZER_PATH)
+        print(f"✅ GCP v2 recognizer exists: {RECOGNIZER_ID}")
     except Exception:
-        print(f"🔨 Creating recognizer: {RECOGNIZER_ID}")
+        print(f"🔨 Creating GCP v2 recognizer: {RECOGNIZER_ID}")
         try:
             request = cloud_speech.CreateRecognizerRequest(
                 parent=f"projects/{PROJECT_ID}/locations/global",
@@ -84,96 +97,61 @@ def ensure_recognizer_exists():
                     model="long",
                 ),
             )
-            operation = speech_client.create_recognizer(request=request)
+            operation = speech_v2_client.create_recognizer(request=request)
             operation.result(timeout=300)
-            print(f"✅ Recognizer created: {RECOGNIZER_ID}")
+            print(f"✅ GCP v2 recognizer created")
         except Exception as e:
-            print(f"❌ Failed to create recognizer: {e}")
-            raise
+            print(f"❌ Failed to create GCP v2 recognizer: {e}")
 
-def build_streaming_config(sample_rate: int = 48000) -> cloud_speech.StreamingRecognitionConfig:
-    recognition_config = cloud_speech.RecognitionConfig(
-        explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
-            encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=sample_rate,
-            audio_channel_count=1,
-        ),
-        language_codes=["en-US", "ja-JP"],
-        model="long",
-        features=cloud_speech.RecognitionFeatures(
-            enable_automatic_punctuation=True,
-            enable_word_time_offsets=True,
-            enable_word_confidence=True,
-        ),
-    )
+# ========== GCP V1 STT THREAD ==========
+def start_gcp_v1_thread(audio_q, websocket, loop, sample_rate, session):
+    print(f"🎤 [GCP v1] Thread started ({sample_rate}Hz)")
     
-    return cloud_speech.StreamingRecognitionConfig(
-        config=recognition_config,
-        streaming_features=cloud_speech.StreamingRecognitionFeatures(
-            interim_results=True,
-        ),
-    )
-    
-def generate_summary(transcripts: list) -> dict:
-    """Generate summary from transcripts using OpenAI."""
-    if not transcripts:
-        return {"summary": "No transcription available", "key_points": []}
-    
-    full_text = "\n".join([f"{t['speaker']}: {t['text']}" for t in transcripts])
-    
-    try:
-        response = openai_client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that summarizes conversations. Provide a concise brief summary and extract 3-5 key points."},
-                {"role": "user", "content": f"Summarize this conversation:\n\n{full_text}\n\nProvide:\n1. A brief summary (2-3 sentences)\n2. Key points (3-5 bullet points)"}
-            ],
-            temperature=0.7,
-            max_tokens=500
+    def build_v1_config():
+        diarization_config = speech_v1.SpeakerDiarizationConfig(
+            enable_speaker_diarization=True,
+            min_speaker_count=2,
+            max_speaker_count=6,
         )
         
-        summary_text = response.choices[0].message.content
-        print(f"✅ Summary generated: {len(summary_text)} chars")
-        return {"summary": summary_text, "error": None}
-    
-    except Exception as e:
-        print(f"❌ Summary generation failed: {e}")
-        return {"summary": None, "error": str(e)}
-
-def start_stt_thread(
-    audio_q: "queue.Queue[Optional[bytes]]",
-    websocket: websockets.WebSocketServerProtocol,
-    loop: asyncio.AbstractEventLoop,
-    sample_rate: int,
-    session: RecordingSession,
-):
-    print(f"🎤 STT thread started ({sample_rate}Hz, EN/JP, 2 speakers)")
+        rec_config = speech_v1.RecognitionConfig(
+            encoding=speech_v1.RecognitionConfig.AudioEncoding.LINEAR16,
+            sample_rate_hertz=sample_rate,
+            audio_channel_count=1,
+            language_code="ja-JP",
+            alternative_language_codes=["en-US"],
+            enable_automatic_punctuation=True,
+            diarization_config=diarization_config,
+            model="default",
+            use_enhanced=True,
+        )
+        
+        return speech_v1.StreamingRecognitionConfig(
+            config=rec_config,
+            interim_results=True,
+        )
     
     while True:
-        streaming_config = build_streaming_config(sample_rate)
+        streaming_config = build_v1_config()
         
-        def request_generator():
-            chunk_count = 0
-            yield cloud_speech.StreamingRecognizeRequest(
-                recognizer=RECOGNIZER_PATH,
-                streaming_config=streaming_config,
-            )
-            
+        def audio_generator():
             while True:
                 try:
                     chunk = audio_q.get(timeout=1.0)
                     if chunk is None:
-                        print(f"🛑 Stop signal received ({chunk_count} chunks)")
                         return
                     if len(chunk) > 0:
-                        chunk_count += 1
-                        yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
+                        yield chunk
                 except queue.Empty:
                     continue
         
         try:
-            responses = speech_client.streaming_recognize(requests=request_generator())
-            print("📊 STT stream active")
+            requests = (
+                speech_v1.StreamingRecognizeRequest(audio_content=content)
+                for content in audio_generator()
+            )
+            
+            responses = speech_v1_client.streaming_recognize(streaming_config, requests)
             
             for response in responses:
                 if not response.results:
@@ -187,68 +165,229 @@ def start_stt_thread(
                     transcript = alt.transcript or ""
                     is_final = bool(result.is_final)
                     
-                    detected_language = result.language_code if hasattr(result, 'language_code') else "en-US"
-                    language_name = "English" if detected_language.startswith("en") else "Japanese" if detected_language.startswith("ja") else detected_language
-                    
                     speaker_tag = None
-                    if alt.words and len(alt.words) > 0:
-                        speaker_tags = [word.speaker_label for word in alt.words if hasattr(word, 'speaker_label') and word.speaker_label]
+                    if alt.words:
+                        speaker_tags = [getattr(w, "speaker_tag", None) for w in alt.words if getattr(w, "speaker_tag", None)]
                         if speaker_tags:
                             speaker_tag = Counter(speaker_tags).most_common(1)[0][0]
                     
                     speaker_label = f"Speaker {speaker_tag}" if speaker_tag else "Speaker"
-                    confidence = alt.confidence if is_final and hasattr(alt, 'confidence') else None
                     
                     if is_final and transcript.strip():
-                        session.add_transcript(speaker_label, transcript, language_name)
+                        session.add_transcript("gcp_v1", speaker_label, transcript)
                     
-                    status = "✅" if is_final else "⏳"
-                    print(f"{status} [{language_name}] {speaker_label}: {transcript}")
-
                     payload = {
                         "type": "transcript",
+                        "service": "gcp_v1",
                         "text": transcript,
                         "final": is_final,
                         "speaker": speaker_label,
-                        "language": detected_language,
-                        "language_name": language_name,
-                        "confidence": confidence,
-                        "ts": datetime.utcnow().isoformat() + "Z",
                     }
                     
                     asyncio.run_coroutine_threadsafe(websocket.send(json.dumps(payload)), loop)
             
-            print("✅ STT stream closed")
             break
             
         except Exception as e:
-            error_str = str(e)
-            
-            if "Audio Timeout" in error_str or "OUT_OF_RANGE" in error_str:
-                print("⟳ Restarting stream (silence timeout)")
+            if "Audio Timeout" in str(e) or "OUT_OF_RANGE" in str(e):
                 continue
             else:
-                print(f"❌ STT error: {e}")
+                print(f"❌ [GCP v1] Error: {e}")
                 break
     
-    print("🎤 STT thread exiting")
+    print("🎤 [GCP v1] Thread exiting")
 
+# ========== GCP V2 STT THREAD ==========
+def start_gcp_v2_thread(audio_q, websocket, loop, sample_rate, session):
+    print(f"🎤 [GCP v2] Thread started ({sample_rate}Hz)")
+    
+    def build_v2_config():
+        recognition_config = cloud_speech.RecognitionConfig(
+            explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
+                encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
+                sample_rate_hertz=sample_rate,
+                audio_channel_count=1,
+            ),
+            language_codes=["en-US", "ja-JP"],
+            model="long",
+            features=cloud_speech.RecognitionFeatures(
+                enable_automatic_punctuation=True,
+            ),
+        )
+        
+        return cloud_speech.StreamingRecognitionConfig(
+            config=recognition_config,
+            streaming_features=cloud_speech.StreamingRecognitionFeatures(
+                interim_results=True,
+            ),
+        )
+    
+    while True:
+        streaming_config = build_v2_config()
+        
+        def request_generator():
+            yield cloud_speech.StreamingRecognizeRequest(
+                recognizer=RECOGNIZER_PATH,
+                streaming_config=streaming_config,
+            )
+            
+            while True:
+                try:
+                    chunk = audio_q.get(timeout=1.0)
+                    if chunk is None:
+                        return
+                    if len(chunk) > 0:
+                        yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
+                except queue.Empty:
+                    continue
+        
+        try:
+            responses = speech_v2_client.streaming_recognize(requests=request_generator())
+            
+            for response in responses:
+                if not response.results:
+                    continue
+                    
+                for result in response.results:
+                    if not result.alternatives:
+                        continue
+                        
+                    alt = result.alternatives[0]
+                    transcript = alt.transcript or ""
+                    is_final = bool(result.is_final)
+                    
+                    speaker_tag = None
+                    if alt.words:
+                        speaker_tags = [w.speaker_label for w in alt.words if hasattr(w, 'speaker_label') and w.speaker_label]
+                        if speaker_tags:
+                            speaker_tag = Counter(speaker_tags).most_common(1)[0][0]
+                    
+                    speaker_label = f"Speaker {speaker_tag}" if speaker_tag else "Speaker"
+                    
+                    if is_final and transcript.strip():
+                        session.add_transcript("gcp_v2", speaker_label, transcript)
+                    
+                    payload = {
+                        "type": "transcript",
+                        "service": "gcp_v2",
+                        "text": transcript,
+                        "final": is_final,
+                        "speaker": speaker_label,
+                    }
+                    
+                    asyncio.run_coroutine_threadsafe(websocket.send(json.dumps(payload)), loop)
+            
+            break
+            
+        except Exception as e:
+            if "Audio Timeout" in str(e):
+                continue
+            else:
+                print(f"❌ [GCP v2] Error: {e}")
+                break
+    
+    print("🎤 [GCP v2] Thread exiting")
+
+# ========== AWS TRANSCRIBE THREAD ==========
+class AWSStreamHandler(TranscriptResultStreamHandler):
+    def __init__(self, output_stream, websocket, loop, session):
+        super().__init__(output_stream)
+        self.websocket = websocket
+        self.loop = loop
+        self.session = session
+
+    async def handle_transcript_event(self, event: TranscriptEvent):
+        for result in event.transcript.results:
+            for alternative in result.alternatives:
+                speaker = None
+                if alternative.items:
+                    for item in alternative.items:
+                        if hasattr(item, 'speaker') and item.speaker is not None:
+                            speaker = item.speaker
+                            break
+                
+                speaker_label = f"Speaker {int(speaker) + 1}" if speaker is not None else "Speaker"
+                transcript = alternative.transcript
+                is_final = not result.is_partial
+                
+                if is_final and transcript.strip():
+                    self.session.add_transcript("aws", speaker_label, transcript)
+                
+                payload = {
+                    "type": "transcript",
+                    "service": "aws",
+                    "text": transcript,
+                    "final": is_final,
+                    "speaker": speaker_label,
+                }
+                
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self.websocket.send(json.dumps(payload)), 
+                        self.loop
+                    )
+                except Exception as e:
+                    print(f"❌ [AWS] Send error: {e}")
+
+def start_aws_thread(audio_q, websocket, loop, sample_rate, session):
+    print(f"🎤 [AWS] Thread started ({sample_rate}Hz)")
+    
+    async def run_aws_stream():
+        try:
+            client = TranscribeStreamingClient(region=AWS_REGION)
+            stream = await client.start_stream_transcription(
+                language_code="ja-JP",
+                media_sample_rate_hz=sample_rate,
+                media_encoding="pcm",
+                show_speaker_label=True,
+            )
+            
+            handler = AWSStreamHandler(stream.output_stream, websocket, loop, session)
+            
+            async def send_audio():
+                while True:
+                    try:
+                        chunk = audio_q.get(timeout=1.0)
+                        if chunk is None:
+                            await stream.input_stream.end_stream()
+                            break
+                        if len(chunk) > 0:
+                            await stream.input_stream.send_audio_event(audio_chunk=chunk)
+                    except queue.Empty:
+                        continue
+            
+            await asyncio.gather(
+                send_audio(),
+                handler.handle_events()
+            )
+            
+        except Exception as e:
+            print(f"❌ [AWS] Error: {e}")
+    
+    asyncio.run(run_aws_stream())
+    print("🎤 [AWS] Thread exiting")
+
+# ========== WEBSOCKET HANDLER ==========
 async def handle_client(websocket):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    session = RecordingSession(session_id, file_ext="raw")
+    session = RecordingSession(session_id)
     sessions[session_id] = session
 
-    audio_q: "queue.Queue[Optional[bytes]]" = None
+    audio_queues = {
+        "gcp_v1": None,
+        "gcp_v2": None,
+        "aws": None
+    }
     current_sample_rate = 48000
     recording_active = False
-    stt_thread = None
+    stt_threads = []
 
-    print(f"\n🟢 New client: {session_id}")
+    print(f"\n🟢 Client connected: {session_id}")
 
     await websocket.send(json.dumps({
         "type": "connected",
         "session_id": session_id,
-        "message": "WebSocket connection established"
+        "message": "Connected to unified transcription server"
     }))
 
     loop = asyncio.get_event_loop()
@@ -261,17 +400,39 @@ async def handle_client(websocket):
                 
                 if not recording_active:
                     recording_active = True
-                    audio_q = queue.Queue()
-                    stt_thread = threading.Thread(
-                        target=start_stt_thread,
-                        args=(audio_q, websocket, loop, current_sample_rate, session),
+                    
+                    # Create audio queues for all 3 services
+                    audio_queues["gcp_v1"] = queue.Queue()
+                    audio_queues["gcp_v2"] = queue.Queue()
+                    audio_queues["aws"] = queue.Queue()
+                    
+                    # Start all 3 STT threads
+                    t1 = threading.Thread(
+                        target=start_gcp_v1_thread,
+                        args=(audio_queues["gcp_v1"], websocket, loop, current_sample_rate, session),
                         daemon=True
                     )
-                    stt_thread.start()
-                    print("🎙️ Recording started")
+                    t2 = threading.Thread(
+                        target=start_gcp_v2_thread,
+                        args=(audio_queues["gcp_v2"], websocket, loop, current_sample_rate, session),
+                        daemon=True
+                    )
+                    t3 = threading.Thread(
+                        target=start_aws_thread,
+                        args=(audio_queues["aws"], websocket, loop, current_sample_rate, session),
+                        daemon=True
+                    )
+                    
+                    stt_threads = [t1, t2, t3]
+                    for t in stt_threads:
+                        t.start()
+                    
+                    print("🎙️ All 3 services started")
                 
-                if audio_q:
-                    audio_q.put(chunk)
+                # Send audio to all 3 queues
+                for q in audio_queues.values():
+                    if q:
+                        q.put(chunk)
                     
             else:
                 try:
@@ -279,35 +440,29 @@ async def handle_client(websocket):
                     if data.get("type") == "audio_format":
                         sr = int(data.get("sampleRateHertz", current_sample_rate))
                         current_sample_rate = sr
-                        print(f"🎵 Format: {data.get('encoding', 'LINEAR16')}, {sr}Hz")
+                        print(f"🎵 Audio format: {sr}Hz")
                         await websocket.send(json.dumps({
                             "type": "audio_format_ack",
-                            "sampleRateHertz": sr,
-                            "encoding": data.get("encoding", "LINEAR16"),
-                            "channels": data.get("channels", 1)
+                            "sampleRateHertz": sr
                         }))
                     elif data.get("type") == "recording_stopped":
                         print("🛑 Recording stopped")
-                        if recording_active and audio_q:
-                            audio_q.put(None)
-                            if stt_thread:
-                                stt_thread.join(timeout=3.0)
-                        
-                        print("🤖 Generating summary...")
-                        summary_result = generate_summary(session.transcripts)
+                        if recording_active:
+                            for q in audio_queues.values():
+                                if q:
+                                    q.put(None)
+                            for t in stt_threads:
+                                t.join(timeout=3.0)
                         
                         recording_active = False
-                        audio_q = None
-                        stt_thread = None
                         
                         await websocket.send(json.dumps({
                             "type": "recording_stopped_ack",
-                            "message": "Recording stopped",
-                            "summary": summary_result
+                            "message": "Recording stopped"
                         }))
                     elif data.get("type") == "recording_complete":
                         stats = session.get_stats()
-                        print(f"🎬 Complete: {stats['total_mb']} MB, {stats['duration_seconds']}s")
+                        print(f"🎬 Complete: {stats}")
                         await websocket.send(json.dumps({
                             "type": "recording_saved",
                             "stats": stats
@@ -320,26 +475,26 @@ async def handle_client(websocket):
     except Exception as e:
         print(f"❌ Error: {e}")
     finally:
-        if recording_active and audio_q:
-            audio_q.put(None)
-        if stt_thread:
-            stt_thread.join(timeout=3.0)
+        if recording_active:
+            for q in audio_queues.values():
+                if q:
+                    q.put(None)
+        for t in stt_threads:
+            t.join(timeout=3.0)
         if session_id in sessions:
-            stats = sessions[session_id].get_stats()
-            print(f"\n🔴 Disconnected: {stats['total_mb']} MB, {stats['duration_seconds']}s")
             del sessions[session_id]
-            
+
 async def main():
     host = "localhost"
     port = 8765
     
-    print(f"🚀 WebSocket Server Starting...")
+    print(f"🚀 Unified Transcription Server Starting...")
     print(f"📡 Listening on ws://{host}:{port}")
-    print(f"📁 Recordings: {os.path.abspath(SAVE_DIR)}")
-    print(f"🌐 EN/JP (v2 API) • 2 speakers\n")
+    print(f"🌐 Services: GCP v1, GCP v2, AWS Transcribe\n")
     
-    # Ensure recognizer exists before starting server
-    ensure_recognizer_exists()
+    # Ensure GCP v2 recognizer exists
+    if PROJECT_ID:
+        ensure_gcp_v2_recognizer()
     
     async with websockets.serve(handle_client, host, port, max_size=10 * 1024 * 1024):
         await asyncio.Future()

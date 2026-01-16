@@ -1,11 +1,10 @@
 // App.jsx
-// Multi-speaker, multi-language live transcription with Meeting Mode Selection
+// 3-panel transcription UI for GCP v1, GCP v2, AWS Transcribe
 
 import React, { useState, useRef, useEffect } from "react";
 import "./App.css";
 
 function App() {
-  const [recordingMode, setRecordingMode] = useState("online"); // "online" or "in-person"
   const [recording, setRecording] = useState(false);
   const [videoURL, setVideoURL] = useState(null);
   const [status, setStatus] = useState("");
@@ -13,11 +12,13 @@ function App() {
   const [recordingSize, setRecordingSize] = useState(0);
   const [wsConnected, setWsConnected] = useState(false);
   const [wsStatus, setWsStatus] = useState("Disconnected");
-  const [summary, setSummary] = useState(null);
 
-  // Transcription state
-  const [finalLines, setFinalLines] = useState([]);
-  const [interimText, setInterimText] = useState("");
+  // Transcription state for 3 services
+  const [transcripts, setTranscripts] = useState({
+    gcp_v1: { final: [], interim: "" },
+    gcp_v2: { final: [], interim: "" },
+    aws: { final: [], interim: "" }
+  });
 
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
@@ -63,7 +64,6 @@ function App() {
         setWsConnected(true);
         setWsStatus("Connected");
         console.log(`✅ WebSocket connected`);
-        console.log(`🎵 Sending audio format: LINEAR16, ${sampleRateRef.current}Hz, mono`);
         try {
           ws.send(JSON.stringify({
             type: "audio_format",
@@ -81,37 +81,40 @@ function App() {
           const data = JSON.parse(event.data);
           
           if (data.type === "transcript") {
+            const service = data.service; // "gcp_v1", "gcp_v2", or "aws"
             const speaker = data.speaker || "Speaker";
-            const language = data.language_name || data.language || "Unknown";
-            const confidence = data.confidence;
+            const text = (data.text || "").trim();
             
             if (data.final) {
               const newLine = {
                 id: `${Date.now()}-${Math.random()}`,
                 speaker,
-                text: (data.text || "").trim(),
-                language,
-                confidence,
-                timestamp: data.ts
+                text,
+                timestamp: Date.now()
               };
-              setFinalLines(prev => [...prev, newLine]);
-              setInterimText("");
               
-              console.log(`✅ FINAL [${language}] ${speaker}: ${data.text}`);
-              if (confidence) {
-                console.log(`   Confidence: ${(confidence * 100).toFixed(1)}%`);
-              }
+              setTranscripts(prev => ({
+                ...prev,
+                [service]: {
+                  final: [...prev[service].final, newLine],
+                  interim: ""
+                }
+              }));
+              
+              console.log(`✅ FINAL [${service}] ${speaker}: ${text}`);
             } else {
-              setInterimText(`${speaker}: ${(data.text || "").trim()}`);
-              console.log(`⏳ INTERIM [${language}] ${speaker}: ${data.text}`);
+              setTranscripts(prev => ({
+                ...prev,
+                [service]: {
+                  ...prev[service],
+                  interim: `${speaker}: ${text}`
+                }
+              }));
+              console.log(`⏳ INTERIM [${service}] ${speaker}: ${text}`);
             }
           } 
           else if (data.type === "recording_stopped_ack") {
             console.log("🛑 Recording stopped acknowledged");
-            if (data.summary) {
-              setSummary(data.summary);
-              console.log("📋 Summary received:", data.summary);
-            }
           }
           else if (data.type === "connected") {
             console.log("✅ Connected to server:", data.message);
@@ -154,7 +157,9 @@ function App() {
       setDuration(0);
       setRecordingSize(0);
 
-      const audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      const audioContext = new (window.AudioContext || window.webkitAudioContext)({
+        sampleRate: 48000
+      });
       audioContextRef.current = audioContext;
       sampleRateRef.current = audioContext.sampleRate;
       console.log(`🎵 AudioContext sample rate: ${audioContext.sampleRate}Hz`);
@@ -173,93 +178,85 @@ function App() {
       micGain.gain.value = 1.0;
       micSource.connect(micGain).connect(mixingBus);
 
-      // If online meeting, get screen + system audio
-      if (recordingMode === "online") {
-        const screenStream = await navigator.mediaDevices.getDisplayMedia({
-          video: { cursor: "always" },
-          audio: true,
-        });
-        screenStreamRef.current = screenStream;
+      // Get screen + system audio
+      const screenStream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: "always" },
+        audio: true,
+      });
+      screenStreamRef.current = screenStream;
 
-        if (screenStream.getAudioTracks().length > 0) {
-          const screenSource = audioContext.createMediaStreamSource(screenStream);
-          const screenGain = audioContext.createGain();
-          screenGain.gain.value = 1.0;
-          screenSource.connect(screenGain).connect(mixingBus);
-          console.log("✅ System audio detected and connected");
-        } else {
-          console.warn("⚠️ No system audio detected");
-        }
-
-        mixingBus.connect(destination);
-
-        // Combine video + mixed audio for local recording
-        const combinedStream = new MediaStream([
-          ...screenStream.getVideoTracks(),
-          ...destination.stream.getAudioTracks(),
-        ]);
-        streamRef.current = combinedStream;
-
-        // Audio visualizers for online mode
-        micAnalyserRef.current = audioContext.createAnalyser();
-        const micSourceForVis = audioContext.createMediaStreamSource(micStream);
-        micSourceForVis.connect(micAnalyserRef.current);
-
-        if (screenStream.getAudioTracks().length > 0) {
-          systemAnalyserRef.current = audioContext.createAnalyser();
-          const systemSourceForVis = audioContext.createMediaStreamSource(screenStream);
-          systemSourceForVis.connect(systemAnalyserRef.current);
-        }
-
-        visualizeAudioLevels();
+      if (screenStream.getAudioTracks().length > 0) {
+        const screenSource = audioContext.createMediaStreamSource(screenStream);
+        const screenGain = audioContext.createGain();
+        screenGain.gain.value = 1.0;
+        screenSource.connect(screenGain).connect(mixingBus);
+        console.log("✅ System audio detected and connected");
       } else {
-        // In-person mode: just microphone, no visualizer
-        mixingBus.connect(destination);
-        streamRef.current = destination.stream;
+        console.warn("⚠️ No system audio detected");
       }
 
-      // Local video recorder (only for online mode)
-      if (recordingMode === "online") {
-        const mimeType = getSupportedMimeType();
-        const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType });
-        mediaRecorderRef.current = mediaRecorder;
-        chunksRef.current = [];
+      mixingBus.connect(destination);
 
-        mediaRecorder.ondataavailable = (event) => {
-          if (event.data.size > 0) {
-            chunksRef.current.push(event.data);
-            setRecordingSize((prev) => prev + event.data.size);
-          }
-        };
+      // Combine video + mixed audio for local recording
+      const combinedStream = new MediaStream([
+        ...screenStream.getVideoTracks(),
+        ...destination.stream.getAudioTracks(),
+      ]);
+      streamRef.current = combinedStream;
 
-        mediaRecorder.onstop = async () => {
-          const blob = new Blob(chunksRef.current, { type: mimeType });
-          const url = URL.createObjectURL(blob);
+      // Audio visualizers
+      micAnalyserRef.current = audioContext.createAnalyser();
+      const micSourceForVis = audioContext.createMediaStreamSource(micStream);
+      micSourceForVis.connect(micAnalyserRef.current);
 
-          if (videoURL) URL.revokeObjectURL(videoURL);
-          setVideoURL(url);
-
-          setStatus("Recording complete");
-
-          // Auto-download
-          const a = document.createElement("a");
-          a.href = url;
-          a.download = `recording_${Date.now()}.webm`;
-          a.click();
-
-          // Notify server
-          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-            wsRef.current.send(JSON.stringify({
-              type: "recording_complete",
-              timestamp: Date.now(),
-              total_size: recordingSize,
-              duration: duration
-            }));
-          }
-        };
-
-        mediaRecorder.start(1000);
+      if (screenStream.getAudioTracks().length > 0) {
+        systemAnalyserRef.current = audioContext.createAnalyser();
+        const systemSourceForVis = audioContext.createMediaStreamSource(screenStream);
+        systemSourceForVis.connect(systemAnalyserRef.current);
       }
+
+      visualizeAudioLevels();
+
+      // Local video recorder
+      const mimeType = getSupportedMimeType();
+      const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType });
+      mediaRecorderRef.current = mediaRecorder;
+      chunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          chunksRef.current.push(event.data);
+          setRecordingSize((prev) => prev + event.data.size);
+        }
+      };
+
+      mediaRecorder.onstop = async () => {
+        const blob = new Blob(chunksRef.current, { type: mimeType });
+        const url = URL.createObjectURL(blob);
+
+        if (videoURL) URL.revokeObjectURL(videoURL);
+        setVideoURL(url);
+
+        setStatus("Recording complete");
+
+        // Auto-download
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = `recording_${Date.now()}.webm`;
+        a.click();
+
+        // Notify server
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({
+            type: "recording_complete",
+            timestamp: Date.now(),
+            total_size: recordingSize,
+            duration: duration
+          }));
+        }
+      };
+
+      mediaRecorder.start(1000);
 
       // PCM streaming to backend
       await initPcmWorklet(audioContext);
@@ -280,16 +277,11 @@ function App() {
         pcmByteBufferRef.current.push(u8);
         pcmBufferedBytesRef.current += u8.byteLength;
 
-        if (pcmBufferedBytesRef.current % 10000 < u8.byteLength) {
-          console.log(`📤 Buffered ${pcmBufferedBytesRef.current} bytes`);
-        }
-
         while (pcmBufferedBytesRef.current >= desiredBytesPerChunkRef.current) {
           const chunk = takeBytesFromBuffer(desiredBytesPerChunkRef.current);
           if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
             try {
               wsRef.current.send(chunk.buffer);
-              console.log(`✅ Sent ${chunk.byteLength} bytes to backend`);
             } catch (err) {
               console.error("❌ Failed to send PCM chunk:", err);
               break;
@@ -299,15 +291,18 @@ function App() {
       };
 
       setRecording(true);
-      setStatus(`Recording... (streaming PCM ${sampleRateRef.current}Hz mono)`);
+      setStatus(`Recording... (streaming to all 3 services)`);
 
-      // Reset transcript
-      setFinalLines([]);
-      setInterimText("");
+      // Reset transcripts
+      setTranscripts({
+        gcp_v1: { final: [], interim: "" },
+        gcp_v2: { final: [], interim: "" },
+        aws: { final: [], interim: "" }
+      });
 
       timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
 
-      if (recordingMode === "online" && screenStreamRef.current) {
+      if (screenStreamRef.current) {
         screenStreamRef.current.getVideoTracks()[0].addEventListener("ended", stopRecording);
       }
     } catch (err) {
@@ -358,6 +353,37 @@ function App() {
     if (animationRef.current) cancelAnimationFrame(animationRef.current);
     
     console.log("✅ Recording stopped successfully");
+  };
+
+  const downloadCSV = () => {
+    // Format each service's transcripts with speaker labels
+    const formatTranscript = (serviceData) => {
+      return serviceData.final
+        .map(line => `${line.speaker}: ${line.text}`)
+        .join('\n');
+    };
+
+    const gcpV1Formatted = formatTranscript(transcripts.gcp_v1);
+    const gcpV2Formatted = formatTranscript(transcripts.gcp_v2);
+    const awsFormatted = formatTranscript(transcripts.aws);
+
+    // Escape quotes for CSV
+    const escape = (str) => `"${str.replace(/"/g, '""')}"`;
+
+    // Build CSV with formatted transcripts
+    let csvContent = "GCP v1 Text,GCP v2 Text,AWS Text\n";
+    csvContent += `${escape(gcpV1Formatted)},${escape(gcpV2Formatted)},${escape(awsFormatted)}\n`;
+
+    // Download
+    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `transcription_comparison_${Date.now()}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+    
+    console.log("✅ CSV downloaded");
   };
 
   const getSupportedMimeType = () => {
@@ -486,151 +512,139 @@ function App() {
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   };
 
+  const TranscriptPanel = ({ service, title, data }) => (
+    <div className="transcript-panel">
+      <div className="transcript-panel-header">
+        <h3 className="transcript-panel-title">{title}</h3>
+        <div className="transcript-count">{data.final.length} lines</div>
+      </div>
+      
+      <div className="transcript-panel-body">
+        {data.final.map((line) => (
+          <div className="transcript-line" key={line.id}>
+            <div className="speaker-info">
+              <span className="speaker">{line.speaker}</span>
+            </div>
+            <span className="text">{line.text}</span>
+          </div>
+        ))}
+
+        {data.interim && (
+          <div className="transcript-line interim">
+            <span className="text">{data.interim}</span>
+          </div>
+        )}
+        
+        {data.final.length === 0 && !data.interim && (
+          <div className="empty-state">
+            <p className="empty-state-text">Waiting for transcription...</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+
   return (
     <div className="app-page">
-      <div className="left-pane">
-        <div className="app-content">
-          <div className="app-header">
-            <h1 className="app-title">Meeting Recorder</h1>
-            <p className="app-subtitle">Record and transcribe with live speech recognition</p>
-          </div>
-
-          <div className="ws-status">
-            <div className={`ws-indicator ${wsConnected ? 'connected' : 'disconnected'}`}></div>
-            <span className="ws-status-text">{wsStatus}</span>
-          </div>
-
-          <div className="mode-selector">
-            <div className="mode-label">Choose Meeting Type</div>
-            <div className="mode-buttons">
-              <button
-                onClick={() => setRecordingMode("online")}
-                disabled={recording || !wsConnected}
-                className={`mode-btn online ${recordingMode === "online" ? "selected" : ""}`}
-              >
-                <div className="mode-btn-icon">🖥️</div>
-                <div className="mode-btn-text">
-                  <div className="mode-btn-title">Online Meeting</div>
-                  <div className="mode-btn-desc">Screen + Audio</div>
-                </div>
-              </button>
-              <button
-                onClick={() => setRecordingMode("in-person")}
-                disabled={recording || !wsConnected}
-                className={`mode-btn in-person ${recordingMode === "in-person" ? "selected" : ""}`}
-              >
-                <div className="mode-btn-icon">🎤</div>
-                <div className="mode-btn-text">
-                  <div className="mode-btn-title">In-Person Meeting</div>
-                  <div className="mode-btn-desc">Microphone Only</div>
-                </div>
-              </button>
-            </div>
-          </div>
-
-          <div className="control-section">
-            {!recording ? (
-              <button
-                onClick={startRecording}
-                disabled={!wsConnected}
-                className="control-btn start"
-              >
-                Start Recording
-              </button>
-            ) : (
-              <button
-                onClick={stopRecording}
-                className="control-btn stop"
-              >
-                Stop Recording
-              </button>
-            )}
-          </div>
-
-          {recordingMode === "online" && (
-            <div className="visualizer-container">
-              <div className="visualizer-label">Audio Levels</div>
-              <canvas
-                ref={canvasRef}
-                width={350}
-                height={100}
-                className="visualizer-canvas"
-              />
-            </div>
-          )}
-
-          {recording && (
-            <div className="stats-container">
-              <div className="stat-item">
-                <div className="stat-label">Duration</div>
-                <div className="stat-value">{formatTime(duration)}</div>
-              </div>
-              <div className="stat-item">
-                <div className="stat-label">Size</div>
-                <div className="stat-value">{formatSize(recordingSize)}</div>
-              </div>
-            </div>
-          )}
-
-          {status && (
-            <div className="status-message">
-              <span className="status-text">{status}</span>
-            </div>
-          )}
-
-          {videoURL && (
-            <div className="video-preview">
-              <h3 className="video-title">Recorded Video</h3>
-              <video
-                src={videoURL}
-                controls
-                className="video-player"
-              />
-            </div>
-          )}
-
-          <div className="summary-section">
-            <h3 className="summary-title">📋 Summary</h3>
-            <div className="summary-content">
-              {summary && summary.summary ? (
-                <pre className="summary-text">{summary.summary}</pre>
-              ) : (
-                <div className="empty-summary">
-                  <p>No summary yet. Stop recording to generate a summary.</p>
-                </div>
-              )}
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <div className="right-pane">
-        <div className="transcript-header">
-          <h2 className="transcript-title">Live Transcription</h2>
+      <div className="top-section">
+        <div className="app-header">
+          <h1 className="app-title">Real-time Transcription Comparison</h1>
+          <p className="app-subtitle">GCP v1 • GCP v2 • AWS Transcribe</p>
         </div>
 
-        <div className="transcript-body">
-          {finalLines.map((line) => (
-            <div className="transcript-line" key={line.id}>
-              <div className="speaker-info">
-                <span className="speaker">{line.speaker}</span>
-              </div>
-              <span className="text">{line.text}</span>
-            </div>
-          ))}
+        <div className="ws-status">
+          <div className={`ws-indicator ${wsConnected ? 'connected' : 'disconnected'}`}></div>
+          <span className="ws-status-text">{wsStatus}</span>
+        </div>
 
-          {interimText && (
-            <div className="transcript-line interim">
-              <span className="text">{interimText}</span>
-            </div>
+        <div className="control-row">
+          {!recording ? (
+            <button
+              onClick={startRecording}
+              disabled={!wsConnected}
+              className="control-btn start"
+            >
+              Start Recording
+            </button>
+          ) : (
+            <button
+              onClick={stopRecording}
+              className="control-btn stop"
+            >
+              Stop Recording
+            </button>
           )}
           
-          {finalLines.length === 0 && !interimText && (
-            <div className="empty-state">
-              <p className="empty-state-main">🎤 Start speaking to see live transcription</p>
-            </div>
-          )}
+          <button
+            onClick={downloadCSV}
+            disabled={recording || (
+              transcripts.gcp_v1.final.length === 0 &&
+              transcripts.gcp_v2.final.length === 0 &&
+              transcripts.aws.final.length === 0
+            )}
+            className="control-btn download"
+          >
+            Download CSV
+          </button>
         </div>
+
+        <div className="visualizer-container">
+          <div className="visualizer-label">Audio Levels</div>
+          <canvas
+            ref={canvasRef}
+            width={350}
+            height={100}
+            className="visualizer-canvas"
+          />
+        </div>
+
+        {recording && (
+          <div className="stats-container">
+            <div className="stat-item">
+              <div className="stat-label">Duration</div>
+              <div className="stat-value">{formatTime(duration)}</div>
+            </div>
+            <div className="stat-item">
+              <div className="stat-label">Size</div>
+              <div className="stat-value">{formatSize(recordingSize)}</div>
+            </div>
+          </div>
+        )}
+
+        {status && (
+          <div className="status-message">
+            <span className="status-text">{status}</span>
+          </div>
+        )}
+
+        {videoURL && (
+          <div className="video-preview">
+            <h3 className="video-title">Recorded Video</h3>
+            <video
+              src={videoURL}
+              controls
+              className="video-player"
+            />
+          </div>
+        )}
+      </div>
+
+      <div className="transcripts-grid">
+        <TranscriptPanel 
+          service="gcp_v1" 
+          title="GCP v1" 
+          data={transcripts.gcp_v1} 
+        />
+        <TranscriptPanel 
+          service="gcp_v2" 
+          title="GCP v2" 
+          data={transcripts.gcp_v2} 
+        />
+        <TranscriptPanel 
+          service="aws" 
+          title="AWS Transcribe" 
+          data={transcripts.aws} 
+        />
       </div>
     </div>
   );
