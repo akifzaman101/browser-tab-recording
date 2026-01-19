@@ -1,7 +1,8 @@
 // App.jsx
 // 3-panel transcription UI for GCP v1, GCP v2, AWS Transcribe
+// FIXED: Flickering with React.memo + Japanese-only detection
 
-import React, { useState, useRef, useEffect } from "react";
+import React, { useState, useRef, useEffect, memo } from "react";
 import "./App.css";
 
 function App() {
@@ -22,13 +23,11 @@ function App() {
 
   const mediaRecorderRef = useRef(null);
   const streamRef = useRef(null);
-  const micStreamRef = useRef(null);
   const screenStreamRef = useRef(null);
   const chunksRef = useRef([]);
   const audioContextRef = useRef(null);
   const timerRef = useRef(null);
 
-  const micAnalyserRef = useRef(null);
   const systemAnalyserRef = useRef(null);
   const animationRef = useRef(null);
   const canvasRef = useRef(null);
@@ -81,7 +80,7 @@ function App() {
           const data = JSON.parse(event.data);
           
           if (data.type === "transcript") {
-            const service = data.service; // "gcp_v1", "gcp_v2", or "aws"
+            const service = data.service;
             const speaker = data.speaker || "Speaker";
             const text = (data.text || "").trim();
             
@@ -169,16 +168,7 @@ function App() {
       mixingBus.gain.value = 1.0;
       mixingBusRef.current = mixingBus;
 
-      // Get microphone
-      const micStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      micStreamRef.current = micStream;
-
-      const micSource = audioContext.createMediaStreamSource(micStream);
-      const micGain = audioContext.createGain();
-      micGain.gain.value = 1.0;
-      micSource.connect(micGain).connect(mixingBus);
-
-      // Get screen + system audio
+      // Get screen + system audio ONLY (no microphone)
       const screenStream = await navigator.mediaDevices.getDisplayMedia({
         video: { cursor: "always" },
         audio: true,
@@ -193,6 +183,7 @@ function App() {
         console.log("✅ System audio detected and connected");
       } else {
         console.warn("⚠️ No system audio detected");
+        alert("⚠️ No system audio detected! Please make sure to check 'Share audio' when selecting your screen.");
       }
 
       mixingBus.connect(destination);
@@ -204,18 +195,13 @@ function App() {
       ]);
       streamRef.current = combinedStream;
 
-      // Audio visualizers
-      micAnalyserRef.current = audioContext.createAnalyser();
-      const micSourceForVis = audioContext.createMediaStreamSource(micStream);
-      micSourceForVis.connect(micAnalyserRef.current);
-
+      // Audio visualizer (system audio only)
       if (screenStream.getAudioTracks().length > 0) {
         systemAnalyserRef.current = audioContext.createAnalyser();
         const systemSourceForVis = audioContext.createMediaStreamSource(screenStream);
         systemSourceForVis.connect(systemAnalyserRef.current);
+        visualizeAudioLevels();
       }
-
-      visualizeAudioLevels();
 
       // Local video recorder
       const mimeType = getSupportedMimeType();
@@ -237,15 +223,8 @@ function App() {
         if (videoURL) URL.revokeObjectURL(videoURL);
         setVideoURL(url);
 
-        setStatus("Recording complete");
+        setStatus("Recording complete - Video ready for download");
 
-        // Auto-download
-        const a = document.createElement("a");
-        a.href = url;
-        a.download = `recording_${Date.now()}.webm`;
-        a.click();
-
-        // Notify server
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({
             type: "recording_complete",
@@ -342,7 +321,6 @@ function App() {
     pcmBufferedBytesRef.current = 0;
 
     if (streamRef.current) streamRef.current.getTracks().forEach((t) => t.stop());
-    if (micStreamRef.current) micStreamRef.current.getTracks().forEach((t) => t.stop());
     if (screenStreamRef.current) screenStreamRef.current.getTracks().forEach((t) => t.stop());
     if (audioContextRef.current) audioContextRef.current.close();
 
@@ -355,35 +333,34 @@ function App() {
     console.log("✅ Recording stopped successfully");
   };
 
-  const downloadCSV = () => {
-    // Find max length among all services
-    const maxLength = Math.max(
-      transcripts.gcp_v1.final.length,
-      transcripts.gcp_v2.final.length,
-      transcripts.aws.final.length
-    );
-
-    // Build CSV header with BOM for proper Excel encoding
-    const BOM = '\uFEFF';
-    let csvContent = BOM + "GCP v1,GCP v2,AWS Transcribe\n";
+  const downloadVideo = () => {
+    if (!videoURL) return;
     
-    // Add each line row by row
-    for (let i = 0; i < maxLength; i++) {
-      const gcpV1Line = transcripts.gcp_v1.final[i];
-      const gcpV2Line = transcripts.gcp_v2.final[i];
-      const awsLine = transcripts.aws.final[i];
-      
-      const gcpV1Text = gcpV1Line ? `${gcpV1Line.speaker}: ${gcpV1Line.text}` : "";
-      const gcpV2Text = gcpV2Line ? `${gcpV2Line.speaker}: ${gcpV2Line.text}` : "";
-      const awsText = awsLine ? `${awsLine.speaker}: ${awsLine.text}` : "";
-      
-      // Escape quotes for CSV
-      const escape = (str) => `"${str.replace(/"/g, '""')}"`;
-      
-      csvContent += `${escape(gcpV1Text)},${escape(gcpV2Text)},${escape(awsText)}\n`;
-    }
+    const a = document.createElement("a");
+    a.href = videoURL;
+    a.download = `recording_${Date.now()}.webm`;
+    a.click();
+    
+    console.log("✅ Video downloaded");
+  };
 
-    // Download with UTF-8 BOM for Japanese characters
+  const downloadCSV = () => {
+    const formatConversation = (serviceData) => {
+      return serviceData.final
+        .map(line => `${line.speaker}: ${line.text}`)
+        .join('\n');
+    };
+
+    const gcpV1Text = formatConversation(transcripts.gcp_v1);
+    const gcpV2Text = formatConversation(transcripts.gcp_v2);
+    const awsText = formatConversation(transcripts.aws);
+
+    const BOM = '\uFEFF';
+    const escape = (str) => `"${str.replace(/"/g, '""')}"`;
+    
+    let csvContent = BOM + "GCP v1,GCP v2,AWS Transcribe\n";
+    csvContent += `${escape(gcpV1Text)},${escape(gcpV2Text)},${escape(awsText)}\n`;
+
     const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -392,7 +369,7 @@ function App() {
     link.click();
     URL.revokeObjectURL(url);
     
-    console.log("✅ CSV downloaded");
+    console.log("✅ CSV downloaded with full conversations");
   };
 
   const getSupportedMimeType = () => {
@@ -408,35 +385,28 @@ function App() {
     const canvas = canvasRef.current;
     const ctx = canvas.getContext("2d");
 
-    const micAnalyser = micAnalyserRef.current;
     const sysAnalyser = systemAnalyserRef.current;
-    const micData = new Uint8Array(micAnalyser.frequencyBinCount);
-    const sysData = sysAnalyser ? new Uint8Array(sysAnalyser.frequencyBinCount) : null;
+    if (!sysAnalyser) return;
+    
+    const sysData = new Uint8Array(sysAnalyser.frequencyBinCount);
 
     const draw = () => {
       animationRef.current = requestAnimationFrame(draw);
-      micAnalyser.getByteFrequencyData(micData);
-      if (sysAnalyser) sysAnalyser.getByteFrequencyData(sysData);
+      sysAnalyser.getByteFrequencyData(sysData);
 
-      const micAvg = micData.reduce((a, b) => a + b, 0) / micData.length;
-      const sysAvg = sysData ? sysData.reduce((a, b) => a + b, 0) / sysData.length : 0;
+      const sysAvg = sysData.reduce((a, b) => a + b, 0) / sysData.length;
 
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.fillStyle = "#f5f5f5";
       ctx.fillRect(0, 0, canvas.width, canvas.height);
 
-      const micHeight = (micAvg / 255) * (canvas.height - 30);
-      ctx.fillStyle = "#4CAF50";
-      ctx.fillRect(60, canvas.height - 25 - micHeight, 50, micHeight);
-
       const sysHeight = (sysAvg / 255) * (canvas.height - 30);
       ctx.fillStyle = "#2196F3";
-      ctx.fillRect(190, canvas.height - 25 - sysHeight, 50, sysHeight);
+      ctx.fillRect(150, canvas.height - 25 - sysHeight, 50, sysHeight);
 
       ctx.fillStyle = "#666";
       ctx.font = "13px system-ui, -apple-system, sans-serif";
-      ctx.fillText("Microphone", 40, canvas.height - 8);
-      ctx.fillText("System Audio", 165, canvas.height - 8);
+      ctx.fillText("System Audio", 125, canvas.height - 8);
     };
     draw();
   };
@@ -521,44 +491,12 @@ function App() {
     return (bytes / (1024 * 1024)).toFixed(1) + " MB";
   };
 
-  const TranscriptPanel = ({ service, title, data }) => (
-    <div className="transcript-panel">
-      <div className="transcript-panel-header">
-        <h3 className="transcript-panel-title">{title}</h3>
-        <div className="transcript-count">{data.final.length} lines</div>
-      </div>
-      
-      <div className="transcript-panel-body">
-        {data.final.map((line) => (
-          <div className="transcript-line" key={line.id}>
-            <div className="speaker-info">
-              <span className="speaker">{line.speaker}</span>
-            </div>
-            <span className="text">{line.text}</span>
-          </div>
-        ))}
-
-        {data.interim && (
-          <div className="transcript-line interim">
-            <span className="text">{data.interim}</span>
-          </div>
-        )}
-        
-        {data.final.length === 0 && !data.interim && (
-          <div className="empty-state">
-            <p className="empty-state-text">Waiting for transcription...</p>
-          </div>
-        )}
-      </div>
-    </div>
-  );
-
   return (
     <div className="app-page">
       <div className="top-section">
         <div className="app-header">
           <h1 className="app-title">Real-time Transcription Comparison</h1>
-          <p className="app-subtitle">GCP v1 • GCP v2 • AWS Transcribe</p>
+          <p className="app-subtitle">GCP v1 • GCP v2 • AWS Transcribe (Japanese)</p>
         </div>
 
         <div className="ws-status">
@@ -594,6 +532,14 @@ function App() {
             className="control-btn download"
           >
             Download CSV
+          </button>
+          
+          <button
+            onClick={downloadVideo}
+            disabled={!videoURL}
+            className="control-btn download-video"
+          >
+            Download Video
           </button>
         </div>
 
@@ -642,21 +588,78 @@ function App() {
         <TranscriptPanel 
           service="gcp_v1" 
           title="GCP v1" 
-          data={transcripts.gcp_v1} 
+          finalTranscripts={transcripts.gcp_v1.final}
+          interimText={transcripts.gcp_v1.interim}
         />
         <TranscriptPanel 
           service="gcp_v2" 
           title="GCP v2" 
-          data={transcripts.gcp_v2} 
+          finalTranscripts={transcripts.gcp_v2.final}
+          interimText={transcripts.gcp_v2.interim}
         />
         <TranscriptPanel 
           service="aws" 
           title="AWS Transcribe" 
-          data={transcripts.aws} 
+          finalTranscripts={transcripts.aws.final}
+          interimText={transcripts.aws.interim}
         />
       </div>
     </div>
   );
 }
+
+// FIXED: Memoized component to prevent flickering
+const TranscriptLine = memo(({ line }) => (
+  <div className="transcript-line final">
+    <div className="speaker-info">
+      <span className="speaker">{line.speaker}</span>
+    </div>
+    <span className="text">{line.text}</span>
+  </div>
+), (prevProps, nextProps) => {
+  return prevProps.line.id === nextProps.line.id;
+});
+
+const TranscriptPanel = memo(({ service, title, finalTranscripts, interimText }) => {
+  const bodyRef = useRef(null);
+  const prevCountRef = useRef(0);
+  
+  useEffect(() => {
+    if (finalTranscripts.length > prevCountRef.current && bodyRef.current) {
+      bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
+      prevCountRef.current = finalTranscripts.length;
+    }
+  }, [finalTranscripts.length]);
+  
+  return (
+    <div className="transcript-panel">
+      <div className="transcript-panel-header">
+        <h3 className="transcript-panel-title">{title}</h3>
+        <div className="transcript-count">{finalTranscripts.length} lines</div>
+      </div>
+      
+      <div className="transcript-panel-body" ref={bodyRef}>
+        {finalTranscripts.map((line) => (
+          <TranscriptLine key={line.id} line={line} />
+        ))}
+
+        {interimText && (
+          <div className="transcript-line interim">
+            <span className="text">{interimText}</span>
+          </div>
+        )}
+        
+        {finalTranscripts.length === 0 && !interimText && (
+          <div className="empty-state">
+            <p className="empty-state-text">Waiting for transcription...</p>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}, (prevProps, nextProps) => {
+  return prevProps.finalTranscripts === nextProps.finalTranscripts &&
+         prevProps.interimText === nextProps.interimText;
+});
 
 export default App;

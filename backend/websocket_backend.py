@@ -1,12 +1,12 @@
 # unified_transcription_server.py
-# Streams audio to GCP v1, GCP v2, and AWS Transcribe simultaneously
+# OPTIMIZED: Best quality configs for each service + auto-restart for GCP
 
 import asyncio
 import websockets
 import json
 from datetime import datetime
 import os
-from typing import Optional
+import time
 from collections import Counter
 from google.cloud import speech_v1p1beta1 as speech_v1
 from google.cloud.speech_v2 import SpeechClient
@@ -25,6 +25,12 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 PROJECT_ID = os.getenv("GOOGLE_CLOUD_PROJECT")
 AWS_REGION = os.getenv("AWS_REGION", "ap-northeast-1")
+
+# GCP v1 stream limit: restart every 4.5 minutes (before 5-minute timeout)
+GCP_V1_RESTART_INTERVAL = 270  # 4.5 minutes
+
+# GCP v2 stream limit: restart every 4.5 minutes (before 5-minute timeout)  
+GCP_V2_RESTART_INTERVAL = 270  # 4.5 minutes
 
 if not PROJECT_ID:
     raise ValueError("GOOGLE_CLOUD_PROJECT environment variable must be set in .env file")
@@ -49,7 +55,6 @@ class RecordingSession:
             f.write(chunk_data)
     
     def add_transcript(self, service: str, speaker: str, text: str):
-        """Add a final transcript line for a specific service."""
         self.transcripts[service].append({
             "speaker": speaker,
             "text": text,
@@ -78,11 +83,11 @@ speech_v1_client = speech_v1.SpeechClient()
 speech_v2_client = SpeechClient()
 
 # GCP v2 Recognizer setup
-RECOGNIZER_ID = "unified-recognizer"
+RECOGNIZER_ID = "japanese-streaming-recognizer"
 RECOGNIZER_PATH = f"projects/{PROJECT_ID}/locations/global/recognizers/{RECOGNIZER_ID}"
 
 def ensure_gcp_v2_recognizer():
-    """Ensure GCP v2 recognizer exists."""
+    """Ensure GCP v2 recognizer exists (no diarization - not supported for streaming)."""
     try:
         speech_v2_client.get_recognizer(name=RECOGNIZER_PATH)
         print(f"✅ GCP v2 recognizer exists: {RECOGNIZER_ID}")
@@ -93,21 +98,23 @@ def ensure_gcp_v2_recognizer():
                 parent=f"projects/{PROJECT_ID}/locations/global",
                 recognizer_id=RECOGNIZER_ID,
                 recognizer=cloud_speech.Recognizer(
-                    language_codes=["en-US", "ja-JP"],
-                    model="long",
+                    language_codes=["ja-JP"],
+                    model="long",  # Best for long-form audio
                 ),
             )
             operation = speech_v2_client.create_recognizer(request=request)
             operation.result(timeout=300)
-            print(f"✅ GCP v2 recognizer created")
+            print(f"✅ GCP v2 recognizer created successfully")
         except Exception as e:
             print(f"❌ Failed to create GCP v2 recognizer: {e}")
 
-# ========== GCP V1 STT THREAD ==========
+# ========== GCP V1 STT (With Diarization + Auto-restart) ==========
 def start_gcp_v1_thread(audio_q, websocket, loop, sample_rate, session):
-    print(f"🎤 [GCP v1] Thread started ({sample_rate}Hz)")
+    print(f"🎤 [GCP v1] Thread started ({sample_rate}Hz) - Japanese + Diarization")
+    print(f"⏰ [GCP v1] Auto-restart every {GCP_V1_RESTART_INTERVAL}s")
     
     def build_v1_config():
+        """Best quality config for GCP v1 with diarization"""
         diarization_config = speech_v1.SpeakerDiarizationConfig(
             enable_speaker_diarization=True,
             min_speaker_count=2,
@@ -119,11 +126,10 @@ def start_gcp_v1_thread(audio_q, websocket, loop, sample_rate, session):
             sample_rate_hertz=sample_rate,
             audio_channel_count=1,
             language_code="ja-JP",
-            alternative_language_codes=["en-US"],
             enable_automatic_punctuation=True,
             diarization_config=diarization_config,
-            model="default",
-            use_enhanced=True,
+            model="latest_long",  # Best for long-form conversation
+            use_enhanced=True,  # Enhanced model for better quality
         )
         
         return speech_v1.StreamingRecognitionConfig(
@@ -131,14 +137,29 @@ def start_gcp_v1_thread(audio_q, websocket, loop, sample_rate, session):
             interim_results=True,
         )
     
-    while True:
+    restart_count = 0
+    stop_requested = False
+    
+    while not stop_requested:
+        restart_count += 1
+        stream_start_time = time.time()
+        print(f"🔄 [GCP v1] Starting stream #{restart_count}")
+        
         streaming_config = build_v1_config()
+        stream_active = True
         
         def audio_generator():
-            while True:
+            """Pull audio with auto-restart timer"""
+            while stream_active and not stop_requested:
+                # Auto-restart before 5-minute limit
+                if time.time() - stream_start_time >= GCP_V1_RESTART_INTERVAL:
+                    print(f"⏰ [GCP v1] {GCP_V1_RESTART_INTERVAL}s reached, restarting...")
+                    return
+                
                 try:
-                    chunk = audio_q.get(timeout=1.0)
+                    chunk = audio_q.get(timeout=0.5)
                     if chunk is None:
+                        print("🛑 [GCP v1] Stop signal received")
                         return
                     if len(chunk) > 0:
                         yield chunk
@@ -165,9 +186,11 @@ def start_gcp_v1_thread(audio_q, websocket, loop, sample_rate, session):
                     transcript = alt.transcript or ""
                     is_final = bool(result.is_final)
                     
+                    # Extract speaker from words
                     speaker_tag = None
                     if alt.words:
-                        speaker_tags = [getattr(w, "speaker_tag", None) for w in alt.words if getattr(w, "speaker_tag", None)]
+                        speaker_tags = [getattr(w, "speaker_tag", None) for w in alt.words 
+                                       if getattr(w, "speaker_tag", None)]
                         if speaker_tags:
                             speaker_tag = Counter(speaker_tags).most_common(1)[0][0]
                     
@@ -184,34 +207,59 @@ def start_gcp_v1_thread(audio_q, websocket, loop, sample_rate, session):
                         "speaker": speaker_label,
                     }
                     
-                    asyncio.run_coroutine_threadsafe(websocket.send(json.dumps(payload)), loop)
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send(json.dumps(payload)), loop
+                        )
+                    except Exception:
+                        pass
             
-            break
-            
-        except Exception as e:
-            if "Audio Timeout" in str(e) or "OUT_OF_RANGE" in str(e):
+            # Stream ended - check if timer or stop signal
+            elapsed = time.time() - stream_start_time
+            if elapsed >= GCP_V1_RESTART_INTERVAL:
+                print(f"✅ [GCP v1] Stream #{restart_count} completed, restarting...")
                 continue
             else:
-                print(f"❌ [GCP v1] Error: {e}")
-                break
+                print("✅ [GCP v1] Stream ended (stop signal)")
+                stop_requested = True
+            
+        except Exception as e:
+            error_str = str(e)
+            timeout_keywords = ["Audio Timeout", "OUT_OF_RANGE", "exceeds maximum", 
+                              "deadline", "DEADLINE_EXCEEDED"]
+            
+            if any(kw.lower() in error_str.lower() for kw in timeout_keywords):
+                print(f"⚠️ [GCP v1] Timeout error, restarting...")
+                continue
+            else:
+                print(f"❌ [GCP v1] Fatal error: {e}")
+                stop_requested = True
+        
+        finally:
+            stream_active = False
     
-    print("🎤 [GCP v1] Thread exiting")
+    print(f"🎤 [GCP v1] Thread exiting after {restart_count} stream(s)")
 
-# ========== GCP V2 STT THREAD ==========
+
+# ========== GCP V2 STT (No Diarization + Auto-restart) ==========
 def start_gcp_v2_thread(audio_q, websocket, loop, sample_rate, session):
-    print(f"🎤 [GCP v2] Thread started ({sample_rate}Hz)")
+    print(f"🎤 [GCP v2] Thread started ({sample_rate}Hz) - Japanese only")
+    print(f"⏰ [GCP v2] Auto-restart every {GCP_V2_RESTART_INTERVAL}s")
+    print(f"ℹ️  [GCP v2] No diarization (not supported for streaming in v2)")
     
     def build_v2_config():
+        """Best quality config for GCP v2 (no diarization support for streaming)"""
         recognition_config = cloud_speech.RecognitionConfig(
             explicit_decoding_config=cloud_speech.ExplicitDecodingConfig(
                 encoding=cloud_speech.ExplicitDecodingConfig.AudioEncoding.LINEAR16,
                 sample_rate_hertz=sample_rate,
                 audio_channel_count=1,
             ),
-            language_codes=["en-US", "ja-JP"],
-            model="long",
+            language_codes=["ja-JP"],
+            model="long",  # Best for long-form audio
             features=cloud_speech.RecognitionFeatures(
                 enable_automatic_punctuation=True,
+                enable_word_time_offsets=True,
             ),
         )
         
@@ -222,19 +270,34 @@ def start_gcp_v2_thread(audio_q, websocket, loop, sample_rate, session):
             ),
         )
     
-    while True:
+    restart_count = 0
+    stop_requested = False
+    
+    while not stop_requested:
+        restart_count += 1
+        stream_start_time = time.time()
+        print(f"🔄 [GCP v2] Starting stream #{restart_count}")
+        
         streaming_config = build_v2_config()
+        stream_active = True
         
         def request_generator():
+            """Send config + audio with auto-restart timer"""
             yield cloud_speech.StreamingRecognizeRequest(
                 recognizer=RECOGNIZER_PATH,
                 streaming_config=streaming_config,
             )
             
-            while True:
+            while stream_active and not stop_requested:
+                # Auto-restart before 5-minute limit
+                if time.time() - stream_start_time >= GCP_V2_RESTART_INTERVAL:
+                    print(f"⏰ [GCP v2] {GCP_V2_RESTART_INTERVAL}s reached, restarting...")
+                    return
+                
                 try:
-                    chunk = audio_q.get(timeout=1.0)
+                    chunk = audio_q.get(timeout=0.5)
                     if chunk is None:
+                        print("🛑 [GCP v2] Stop signal received")
                         return
                     if len(chunk) > 0:
                         yield cloud_speech.StreamingRecognizeRequest(audio=chunk)
@@ -256,39 +319,52 @@ def start_gcp_v2_thread(audio_q, websocket, loop, sample_rate, session):
                     transcript = alt.transcript or ""
                     is_final = bool(result.is_final)
                     
-                    speaker_tag = None
-                    if alt.words:
-                        speaker_tags = [w.speaker_label for w in alt.words if hasattr(w, 'speaker_label') and w.speaker_label]
-                        if speaker_tags:
-                            speaker_tag = Counter(speaker_tags).most_common(1)[0][0]
-                    
-                    speaker_label = f"Speaker {speaker_tag}" if speaker_tag else "Speaker"
-                    
                     if is_final and transcript.strip():
-                        session.add_transcript("gcp_v2", speaker_label, transcript)
+                        session.add_transcript("gcp_v2", "Speaker", transcript)
                     
                     payload = {
                         "type": "transcript",
                         "service": "gcp_v2",
                         "text": transcript,
                         "final": is_final,
-                        "speaker": speaker_label,
+                        "speaker": "Speaker",  # No diarization
                     }
                     
-                    asyncio.run_coroutine_threadsafe(websocket.send(json.dumps(payload)), loop)
+                    try:
+                        asyncio.run_coroutine_threadsafe(
+                            websocket.send(json.dumps(payload)), loop
+                        )
+                    except Exception:
+                        pass
             
-            break
-            
-        except Exception as e:
-            if "Audio Timeout" in str(e):
+            # Stream ended - check if timer or stop signal
+            elapsed = time.time() - stream_start_time
+            if elapsed >= GCP_V2_RESTART_INTERVAL:
+                print(f"✅ [GCP v2] Stream #{restart_count} completed, restarting...")
                 continue
             else:
-                print(f"❌ [GCP v2] Error: {e}")
-                break
+                print("✅ [GCP v2] Stream ended (stop signal)")
+                stop_requested = True
+            
+        except Exception as e:
+            error_str = str(e)
+            timeout_keywords = ["Audio Timeout", "OUT_OF_RANGE", "exceeds maximum",
+                              "deadline", "DEADLINE_EXCEEDED"]
+            
+            if any(kw.lower() in error_str.lower() for kw in timeout_keywords):
+                print(f"⚠️ [GCP v2] Timeout error, restarting...")
+                continue
+            else:
+                print(f"❌ [GCP v2] Fatal error: {e}")
+                stop_requested = True
+        
+        finally:
+            stream_active = False
     
-    print("🎤 [GCP v2] Thread exiting")
+    print(f"🎤 [GCP v2] Thread exiting after {restart_count} stream(s)")
 
-# ========== AWS TRANSCRIBE THREAD ==========
+
+# ========== AWS TRANSCRIBE (With Diarization, No restart needed) ==========
 class AWSStreamHandler(TranscriptResultStreamHandler):
     def __init__(self, output_stream, websocket, loop, session):
         super().__init__(output_stream)
@@ -299,6 +375,7 @@ class AWSStreamHandler(TranscriptResultStreamHandler):
     async def handle_transcript_event(self, event: TranscriptEvent):
         for result in event.transcript.results:
             for alternative in result.alternatives:
+                # Extract speaker
                 speaker = None
                 if alternative.items:
                     for item in alternative.items:
@@ -326,11 +403,11 @@ class AWSStreamHandler(TranscriptResultStreamHandler):
                         self.websocket.send(json.dumps(payload)), 
                         self.loop
                     )
-                except Exception as e:
-                    print(f"❌ [AWS] Send error: {e}")
+                except Exception:
+                    pass
 
 def start_aws_thread(audio_q, websocket, loop, sample_rate, session):
-    print(f"🎤 [AWS] Thread started ({sample_rate}Hz)")
+    print(f"🎤 [AWS] Thread started ({sample_rate}Hz) - Japanese + Diarization")
     
     async def run_aws_stream():
         try:
@@ -339,7 +416,7 @@ def start_aws_thread(audio_q, websocket, loop, sample_rate, session):
                 language_code="ja-JP",
                 media_sample_rate_hz=sample_rate,
                 media_encoding="pcm",
-                show_speaker_label=True,
+                show_speaker_label=True,  # Enable diarization
             )
             
             handler = AWSStreamHandler(stream.output_stream, websocket, loop, session)
@@ -367,17 +444,14 @@ def start_aws_thread(audio_q, websocket, loop, sample_rate, session):
     asyncio.run(run_aws_stream())
     print("🎤 [AWS] Thread exiting")
 
+
 # ========== WEBSOCKET HANDLER ==========
 async def handle_client(websocket):
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     session = RecordingSession(session_id)
     sessions[session_id] = session
 
-    audio_queues = {
-        "gcp_v1": None,
-        "gcp_v2": None,
-        "aws": None
-    }
+    audio_queues = {"gcp_v1": None, "gcp_v2": None, "aws": None}
     current_sample_rate = 48000
     recording_active = False
     stt_threads = []
@@ -401,12 +475,12 @@ async def handle_client(websocket):
                 if not recording_active:
                     recording_active = True
                     
-                    # Create audio queues for all 3 services
+                    # Create queues
                     audio_queues["gcp_v1"] = queue.Queue()
                     audio_queues["gcp_v2"] = queue.Queue()
                     audio_queues["aws"] = queue.Queue()
                     
-                    # Start all 3 STT threads
+                    # Start threads
                     t1 = threading.Thread(
                         target=start_gcp_v1_thread,
                         args=(audio_queues["gcp_v1"], websocket, loop, current_sample_rate, session),
@@ -427,9 +501,9 @@ async def handle_client(websocket):
                     for t in stt_threads:
                         t.start()
                     
-                    print("🎙️ All 3 services started")
+                    print("🎙️ All services started")
                 
-                # Send audio to all 3 queues
+                # Send audio to all queues
                 for q in audio_queues.values():
                     if q:
                         q.put(chunk)
@@ -452,7 +526,7 @@ async def handle_client(websocket):
                                 if q:
                                     q.put(None)
                             for t in stt_threads:
-                                t.join(timeout=3.0)
+                                t.join(timeout=5.0)
                         
                         recording_active = False
                         
@@ -480,9 +554,10 @@ async def handle_client(websocket):
                 if q:
                     q.put(None)
         for t in stt_threads:
-            t.join(timeout=3.0)
+            t.join(timeout=5.0)
         if session_id in sessions:
             del sessions[session_id]
+
 
 async def main():
     host = "localhost"
@@ -490,9 +565,14 @@ async def main():
     
     print(f"🚀 Unified Transcription Server Starting...")
     print(f"📡 Listening on ws://{host}:{port}")
-    print(f"🌐 Services: GCP v1, GCP v2, AWS Transcribe\n")
+    print(f"🌏 Language: Japanese (ja-JP)")
+    print(f"")
+    print(f"Service Configuration:")
+    print(f"  • GCP v1: Diarization ✓, Auto-restart every {GCP_V1_RESTART_INTERVAL}s")
+    print(f"  • GCP v2: Diarization ✗ (not supported), Auto-restart every {GCP_V2_RESTART_INTERVAL}s")
+    print(f"  • AWS:    Diarization ✓, No restart needed")
+    print(f"")
     
-    # Ensure GCP v2 recognizer exists
     if PROJECT_ID:
         ensure_gcp_v2_recognizer()
     
