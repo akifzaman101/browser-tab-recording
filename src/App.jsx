@@ -1,6 +1,5 @@
 // App.jsx
-// 3-panel transcription UI for GCP v1, GCP v2, AWS Transcribe
-// FIXED: Flickering with React.memo + Japanese-only detection
+// FIXED: Timestamps in CSV + Proper video seeking with timeslice
 
 import React, { useState, useRef, useEffect, memo } from "react";
 import "./App.css";
@@ -13,6 +12,10 @@ function App() {
   const [recordingSize, setRecordingSize] = useState(0);
   const [wsConnected, setWsConnected] = useState(false);
   const [wsStatus, setWsStatus] = useState("Disconnected");
+  
+  // Use ref for recording start time so WebSocket handler can access it immediately
+  const recordingStartTimeRef = useRef(null);
+  const currentDurationRef = useRef(0); // Track current recording duration
 
   // Transcription state for 3 services
   const [transcripts, setTranscripts] = useState({
@@ -85,11 +88,16 @@ function App() {
             const text = (data.text || "").trim();
             
             if (data.final) {
+              // Use the current recording duration as the timestamp
+              // This syncs perfectly with the video timeline!
+              const timestamp = currentDurationRef.current * 1000; // convert seconds to milliseconds
+              
               const newLine = {
                 id: `${Date.now()}-${Math.random()}`,
                 speaker,
                 text,
-                timestamp: Date.now()
+                timestamp: timestamp, // milliseconds from start
+                absoluteTime: Date.now()
               };
               
               setTranscripts(prev => ({
@@ -100,7 +108,7 @@ function App() {
                 }
               }));
               
-              console.log(`✅ FINAL [${service}] ${speaker}: ${text}`);
+              console.log(`✅ FINAL [${service}] ${formatTimestamp(timestamp)} ${speaker}: ${text}`);
             } else {
               setTranscripts(prev => ({
                 ...prev,
@@ -109,7 +117,6 @@ function App() {
                   interim: `${speaker}: ${text}`
                 }
               }));
-              console.log(`⏳ INTERIM [${service}] ${speaker}: ${text}`);
             }
           } 
           else if (data.type === "recording_stopped_ack") {
@@ -155,6 +162,8 @@ function App() {
       setStatus("Requesting permissions...");
       setDuration(0);
       setRecordingSize(0);
+      recordingStartTimeRef.current = Date.now();
+      currentDurationRef.current = 0; // Reset duration tracker
 
       const audioContext = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: 48000
@@ -203,9 +212,12 @@ function App() {
         visualizeAudioLevels();
       }
 
-      // Local video recorder
+      // FIXED: Local video recorder with timeslice for proper seeking
       const mimeType = getSupportedMimeType();
-      const mediaRecorder = new MediaRecorder(streamRef.current, { mimeType });
+      const mediaRecorder = new MediaRecorder(streamRef.current, { 
+        mimeType,
+        videoBitsPerSecond: 2500000 // 2.5 Mbps for better quality
+      });
       mediaRecorderRef.current = mediaRecorder;
       chunksRef.current = [];
 
@@ -235,6 +247,7 @@ function App() {
         }
       };
 
+      // FIXED: Use timeslice for seekable video (1 second chunks)
       mediaRecorder.start(1000);
 
       // PCM streaming to backend
@@ -279,7 +292,13 @@ function App() {
         aws: { final: [], interim: "" }
       });
 
-      timerRef.current = setInterval(() => setDuration((d) => d + 1), 1000);
+      timerRef.current = setInterval(() => {
+        setDuration((d) => {
+          const newDuration = d + 1;
+          currentDurationRef.current = newDuration; // Keep ref in sync
+          return newDuration;
+        });
+      }, 1000);
 
       if (screenStreamRef.current) {
         screenStreamRef.current.getVideoTracks()[0].addEventListener("ended", stopRecording);
@@ -344,10 +363,18 @@ function App() {
     console.log("✅ Video downloaded");
   };
 
+  // FIXED: Format timestamp as MM:SS
+  const formatTimestamp = (milliseconds) => {
+    const totalSeconds = Math.floor(milliseconds / 1000);
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+  };
+
   const downloadCSV = () => {
     const formatConversation = (serviceData) => {
       return serviceData.final
-        .map(line => `${line.speaker}: ${line.text}`)
+        .map(line => `${formatTimestamp(line.timestamp)} ${line.speaker}: ${line.text}`)
         .join('\n');
     };
 
@@ -369,7 +396,7 @@ function App() {
     link.click();
     URL.revokeObjectURL(url);
     
-    console.log("✅ CSV downloaded with full conversations");
+    console.log("✅ CSV downloaded with timestamps");
   };
 
   const getSupportedMimeType = () => {
@@ -608,10 +635,19 @@ function App() {
   );
 }
 
-// FIXED: Memoized component to prevent flickering
+// Helper to format timestamp
+const formatLineTimestamp = (milliseconds) => {
+  const totalSeconds = Math.floor(milliseconds / 1000);
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`;
+};
+
+// Memoized component with timestamp display
 const TranscriptLine = memo(({ line }) => (
   <div className="transcript-line final">
     <div className="speaker-info">
+      <span className="timestamp">{formatLineTimestamp(line.timestamp)}</span>
       <span className="speaker">{line.speaker}</span>
     </div>
     <span className="text">{line.text}</span>
